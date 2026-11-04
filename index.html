@@ -1,0 +1,1194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Apex Freight Logistics - AI Invoice Review Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Reenie+Beanie&display=swap" rel="stylesheet">
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <style>
+    :root {
+      --bg-dark: #0B1220;
+      --card-bg: #111B2E;
+      --card-border: #1E2B45;
+      --accent-blue: #2F80FF;
+      --accent-glow: 0 0 15px rgba(47, 128, 255, 0.4), 0 0 0 1px #2F80FF;
+      --text-white: #FFFFFF;
+      --text-muted: #8FA0BD;
+      --status-green: #22C55E;
+      --status-amber: #F5B83D;
+      --status-red: #EF4444;
+      --input-bg: #0A101C;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background-color: var(--bg-dark);
+      color: var(--text-white);
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      overflow: hidden;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* Fixed Desktop Mockup Canvas 1440x960 */
+    .app-canvas {
+      width: 1440px;
+      height: 960px;
+      background-color: var(--bg-dark);
+      display: flex;
+      flex-direction: column;
+      position: relative;
+      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.7);
+      overflow: hidden;
+    }
+
+    /* TOP NAVBAR */
+    .navbar {
+      height: 64px;
+      padding: 0 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--card-border);
+      background-color: rgba(17, 27, 46, 0.6);
+      backdrop-filter: blur(12px);
+      z-index: 10;
+    }
+
+    .nav-brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .brand-logo-icon {
+      width: 36px;
+      height: 36px;
+      background: linear-gradient(135deg, rgba(47, 128, 255, 0.2), rgba(47, 128, 255, 0.05));
+      border: 1px solid var(--accent-blue);
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--accent-blue);
+      box-shadow: 0 0 12px rgba(47, 128, 255, 0.3);
+    }
+
+    .brand-name {
+      font-size: 17px;
+      font-weight: 700;
+      color: var(--text-white);
+      letter-spacing: -0.2px;
+    }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .nav-link {
+      padding: 8px 14px;
+      font-size: 13.5px;
+      font-weight: 500;
+      color: var(--text-muted);
+      text-decoration: none;
+      border-radius: 8px;
+      transition: all 0.2s ease;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .nav-link:hover {
+      color: var(--text-white);
+      background-color: rgba(255, 255, 255, 0.04);
+    }
+
+    .nav-link.active {
+      color: var(--text-white);
+      background-color: rgba(47, 128, 255, 0.15);
+      border: 1px solid rgba(47, 128, 255, 0.3);
+      font-weight: 600;
+    }
+
+    .nav-badge {
+      background-color: var(--accent-blue);
+      color: var(--text-white);
+      font-size: 11px;
+      font-weight: 700;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      margin-left: 4px;
+    }
+
+    .nav-right-empty {
+      width: 150px; /* Empty account section per spec */
+    }
+
+    /* MAIN BODY - 3 COLUMN LAYOUT */
+    .main-body {
+      flex: 1;
+      padding: 16px 24px;
+      display: grid;
+      grid-template-columns: 33% 28% 39%;
+      gap: 16px;
+      height: calc(960px - 64px);
+      overflow: hidden;
+    }
+
+    /* CARD CONTAINER COMMON */
+    .column-card {
+      background-color: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 14px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+    }
+
+    .card-header {
+      height: 52px;
+      padding: 0 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--card-border);
+      background-color: rgba(255, 255, 255, 0.02);
+    }
+
+    .card-header-title {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text-white);
+    }
+
+    .card-header-title i {
+      color: var(--accent-blue);
+    }
+
+    .icon-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      padding: 6px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s;
+    }
+
+    .icon-btn:hover {
+      color: var(--text-white);
+      background: rgba(255, 255, 255, 0.06);
+    }
+
+    /* COLUMN 1 - ORIGINAL DOCUMENT */
+    .col-document {
+      position: relative;
+    }
+
+    .doc-preview-viewport {
+      flex: 1;
+      padding: 16px;
+      overflow-y: auto;
+      background-color: #080D17;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      width: 100%;
+      height: 100%;
+      box-sizing: border-box;
+    }
+
+    /* Realistic DHL Commercial Invoice Sheet */
+    .document-sheet {
+      width: 100%;
+      max-width: 410px;
+      max-height: 100%;
+      object-fit: contain;
+      margin: auto;
+      background-color: #FFFFFF;
+      color: #111111;
+      padding: 24px 20px;
+      font-family: Arial, Helvetica, sans-serif;
+      font-size: 10px;
+      line-height: 1.3;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+      border-radius: 4px;
+      position: relative;
+    }
+
+    .doc-page-badge {
+      position: absolute;
+      top: 14px;
+      right: 18px;
+      font-size: 9px;
+      font-weight: bold;
+      color: #666666;
+    }
+
+    .dhl-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 12px;
+      padding-bottom: 8px;
+      border-bottom: 2px solid #D40511;
+    }
+
+    .dhl-logo {
+      font-weight: 900;
+      font-size: 20px;
+      color: #D40511;
+      font-style: italic;
+      letter-spacing: -1px;
+    }
+
+    .dhl-logo span {
+      color: #FFCC00;
+      background: #D40511;
+      padding: 0 4px;
+      margin-left: 2px;
+      border-radius: 2px;
+    }
+
+    .doc-title-main {
+      font-size: 14px;
+      font-weight: bold;
+      color: #111;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .doc-grid-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+
+    .doc-box {
+      border: 1px solid #CCCCCC;
+      padding: 6px 8px;
+      border-radius: 2px;
+      background-color: #FAFABA;
+      font-size: 9px;
+    }
+
+    .doc-box-title {
+      font-weight: bold;
+      color: #444;
+      font-size: 8px;
+      text-transform: uppercase;
+      margin-bottom: 3px;
+    }
+
+    .doc-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+      margin-bottom: 12px;
+      font-size: 8.5px;
+    }
+
+    .doc-table th {
+      background-color: #F0F0F0;
+      border: 1px solid #CCCCCC;
+      padding: 4px;
+      text-align: left;
+      font-weight: bold;
+      font-size: 8px;
+    }
+
+    .doc-table td {
+      border: 1px solid #DDDDDD;
+      padding: 5px 4px;
+    }
+
+    .doc-totals-row {
+      font-weight: bold;
+      background-color: #F9F9F9;
+    }
+
+    .signature-area {
+      margin-top: 14px;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      padding-top: 10px;
+      border-top: 1px dashed #CCCCCC;
+    }
+
+    .signature-img {
+      font-family: 'Reenie Beanie', cursive;
+      font-size: 26px;
+      color: #0A1C40;
+      transform: rotate(-3deg);
+      line-height: 1;
+    }
+
+    /* Thumbnail Selector Row */
+    .thumbnail-bar {
+      padding: 10px 14px;
+      background-color: #0D1626;
+      border-top: 1px solid var(--card-border);
+      display: flex;
+      gap: 10px;
+      justify-content: center;
+    }
+
+    .thumb-btn {
+      width: 46px;
+      height: 58px;
+      background-color: #162238;
+      border: 1px solid var(--card-border);
+      border-radius: 6px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: space-between;
+      padding: 4px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .thumb-btn:hover {
+      border-color: var(--accent-blue);
+    }
+
+    .thumb-btn.active {
+      border-color: var(--accent-blue);
+      box-shadow: var(--accent-glow);
+      background-color: rgba(47, 128, 255, 0.1);
+    }
+
+    .thumb-mini-paper {
+      width: 100%;
+      height: 34px;
+      background: white;
+      border-radius: 2px;
+      opacity: 0.8;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      padding: 3px;
+    }
+
+    .thumb-line {
+      height: 2px;
+      background-color: #CCCCCC;
+      border-radius: 1px;
+    }
+
+    .thumb-num {
+      font-size: 10px;
+      font-weight: 600;
+      color: var(--text-muted);
+    }
+
+    .thumb-btn.active .thumb-num {
+      color: var(--text-white);
+    }
+
+    /* Bottom Zoom Toolbar */
+    .doc-toolbar {
+      height: 46px;
+      padding: 0 16px;
+      background-color: #0A111F;
+      border-top: 1px solid var(--card-border);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+    }
+
+    .zoom-text {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-muted);
+      min-width: 45px;
+      text-align: center;
+    }
+
+
+    /* COLUMN 2 - INVOICES LIST */
+    .col-invoices {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .invoices-list {
+      flex: 1;
+      padding: 12px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .invoice-card {
+      background-color: #0D1626;
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 14px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      position: relative;
+    }
+
+    .invoice-card:hover {
+      border-color: rgba(47, 128, 255, 0.4);
+      background-color: #121E33;
+    }
+
+    .invoice-card.selected {
+      border-color: var(--accent-blue);
+      box-shadow: var(--accent-glow);
+      background-color: rgba(47, 128, 255, 0.08);
+    }
+
+    .card-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 8px;
+    }
+
+    .invoice-num-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .doc-file-icon {
+      color: var(--accent-blue);
+      background: rgba(47, 128, 255, 0.1);
+      padding: 5px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .invoice-title {
+      font-size: 13.5px;
+      font-weight: 600;
+      color: var(--text-white);
+    }
+
+    .vendor-name {
+      font-size: 12.5px;
+      font-weight: 500;
+      color: #C5D2E8;
+      margin-top: 2px;
+    }
+
+    .confidence-badge {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--status-green);
+      background: rgba(34, 197, 94, 0.1);
+      padding: 3px 8px;
+      border-radius: 12px;
+      border: 1px solid rgba(34, 197, 94, 0.2);
+    }
+
+    .confidence-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background-color: var(--status-green);
+    }
+
+    .card-bottom {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-top: 10px;
+      padding-top: 8px;
+      border-top: 1px solid rgba(255, 255, 255, 0.04);
+      font-size: 11.5px;
+      color: var(--text-muted);
+    }
+
+    .warning-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      background-color: rgba(245, 184, 61, 0.12);
+      border: 1px solid rgba(245, 184, 61, 0.3);
+      color: var(--status-amber);
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 7px;
+      border-radius: 12px;
+      margin-top: 6px;
+    }
+
+    /* COLUMN 3 - FORM / FIELD REVIEW */
+    .col-form {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .header-controls {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .arrow-btns {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .status-ready-pill {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      background-color: rgba(34, 197, 94, 0.15);
+      border: 1px solid rgba(34, 197, 94, 0.3);
+      color: var(--status-green);
+      font-size: 12px;
+      font-weight: 600;
+      padding: 4px 10px;
+      border-radius: 20px;
+    }
+
+    /* TABS */
+    .tab-bar {
+      display: flex;
+      padding: 0 16px;
+      border-bottom: 1px solid var(--card-border);
+      background-color: rgba(10, 16, 28, 0.5);
+    }
+
+    .tab-item {
+      padding: 12px 14px;
+      font-size: 12.5px;
+      font-weight: 500;
+      color: var(--text-muted);
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      transition: all 0.2s ease;
+    }
+
+    .tab-item:hover {
+      color: var(--text-white);
+    }
+
+    .tab-item.active {
+      color: var(--accent-blue);
+      border-bottom-color: var(--accent-blue);
+      font-weight: 600;
+    }
+
+    /* FORM BODY */
+    .form-content {
+      flex: 1;
+      padding: 16px 20px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .form-grid-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .field-group {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    .field-label {
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+    }
+
+    .input-wrapper {
+      position: relative;
+      display: flex;
+      align-items: center;
+    }
+
+    .form-input {
+      width: 100%;
+      height: 36px;
+      background-color: var(--input-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 0 12px;
+      color: var(--text-white);
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 500;
+      outline: none;
+      transition: all 0.2s ease;
+    }
+
+    .form-input:focus, .form-input.focused-glow {
+      border-color: var(--accent-blue);
+      box-shadow: var(--accent-glow);
+    }
+
+    .input-wrapper i {
+      position: absolute;
+      right: 10px;
+      color: var(--text-muted);
+      pointer-events: none;
+    }
+
+    /* Grouped Section Box */
+    .section-box {
+      border: 1px solid var(--card-border);
+      background-color: rgba(10, 16, 28, 0.4);
+      border-radius: 10px;
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .section-title {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--accent-blue);
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .text-right {
+      text-align: right;
+    }
+
+    /* Bottom Action Area */
+    .form-footer {
+      padding: 14px 20px;
+      border-top: 1px solid var(--card-border);
+      background-color: rgba(10, 16, 28, 0.8);
+    }
+
+    .btn-save {
+      width: 100%;
+      height: 42px;
+      background: linear-gradient(135deg, #2F80FF, #1C62D6);
+      border: none;
+      border-radius: 10px;
+      color: var(--text-white);
+      font-size: 14px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      cursor: pointer;
+      box-shadow: 0 4px 14px rgba(47, 128, 255, 0.35);
+      transition: all 0.2s ease;
+    }
+
+    .btn-save:hover {
+      background: linear-gradient(135deg, #3B88FF, #256CE1);
+      box-shadow: 0 6px 20px rgba(47, 128, 255, 0.5);
+      transform: translateY(-1px);
+    }
+
+    /* Custom Scrollbars */
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #1C2940;
+      border-radius: 4px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: #2A3D5E;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="app-canvas">
+
+    <!-- TOP NAVBAR -->
+    <header class="navbar">
+      <div class="nav-brand">
+        <div class="brand-logo-icon">
+          <i data-lucide="truck"></i>
+        </div>
+        <span class="brand-name">Apex Freight Logistics</span>
+      </div>
+
+      <nav class="nav-links">
+        <a href="#" class="nav-link">Dashboard</a>
+        <a href="#" class="nav-link">Documents</a>
+        <a href="#" class="nav-link">Escalations</a>
+        <a href="#" class="nav-link">Preview</a>
+        <a href="#" class="nav-link">Upload Single</a>
+        <a href="#" class="nav-link">Upload Multiple</a>
+        <a href="#" class="nav-link active">Review Queue <span class="nav-badge">3</span></a>
+        <a href="#" class="nav-link">Invoices</a>
+      </nav>
+
+      <div class="nav-right-empty"></div>
+    </header>
+
+    <!-- MAIN BODY: 3-COLUMN LAYOUT -->
+    <main class="main-body">
+
+      <!-- COLUMN 1: ORIGINAL DOCUMENT -->
+      <section class="column-card col-document">
+        <div class="card-header">
+          <div class="card-header-title">
+            <i data-lucide="file-text"></i>
+            <span>Original Document</span>
+          </div>
+          <button class="icon-btn" title="Options">
+            <i data-lucide="more-horizontal"></i>
+          </button>
+        </div>
+
+        <!-- Document Viewer -->
+        <div class="doc-preview-viewport">
+          <div class="document-sheet">
+            <span class="doc-page-badge">Page 1 of 3</span>
+            
+            <div class="dhl-header">
+              <div class="dhl-logo">DHL<span>EXPRESS</span></div>
+              <div style="text-align: right;">
+                <div class="doc-title-main">Commercial Invoice</div>
+                <div style="font-weight: bold; font-size: 11px; margin-top: 2px;">#67891234</div>
+              </div>
+            </div>
+
+            <div class="doc-grid-2">
+              <div class="doc-box">
+                <div class="doc-box-title">Shipper</div>
+                <strong>Apex Manufacturing Inc.</strong><br>
+                123 Industrial Way<br>
+                Detroit, MI 48201, USA
+              </div>
+              <div class="doc-box">
+                <div class="doc-box-title">Consignee</div>
+                <strong>Global Parts Ltd.</strong><br>
+                456 Logistics Park<br>
+                Hamburg, 20095, Germany
+              </div>
+            </div>
+
+            <div class="doc-grid-2">
+              <div class="doc-box">
+                <div class="doc-box-title">Invoice Date & Terms</div>
+                Date: <strong>May 16, 2024</strong><br>
+                Terms of Sale: <strong>DDP</strong><br>
+                Ref: SO-23891
+              </div>
+              <div class="doc-box">
+                <div class="doc-box-title">Shipment Summary</div>
+                Currency: <strong>USD</strong><br>
+                Total Weight: <strong>850.00 KG</strong><br>
+                Packages: <strong>200 CTN</strong>
+              </div>
+            </div>
+
+            <table class="doc-table">
+              <thead>
+                <tr>
+                  <th>HS Code</th>
+                  <th>Description</th>
+                  <th>Qty</th>
+                  <th>Unit (USD)</th>
+                  <th style="text-align: right;">Total (USD)</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>8708.29.90</td>
+                  <td>Commercial Auto Components</td>
+                  <td>100</td>
+                  <td>140.00</td>
+                  <td style="text-align: right;">14,000.00</td>
+                </tr>
+                <tr>
+                  <td>8409.91.00</td>
+                  <td>Hydraulic Valves & Assemblies</td>
+                  <td>50</td>
+                  <td>120.00</td>
+                  <td style="text-align: right;">6,000.00</td>
+                </tr>
+                <tr>
+                  <td>8504.40.95</td>
+                  <td>Power Converter Modules</td>
+                  <td>50</td>
+                  <td>80.00</td>
+                  <td style="text-align: right;">4,000.00</td>
+                </tr>
+                <tr class="doc-totals-row">
+                  <td colspan="4" style="text-align: right; text-transform: uppercase;">Total Invoice Value:</td>
+                  <td style="text-align: right; color: #D40511;">$24,000.00</td>
+                </tr>
+              </tbody>
+            </table>
+
+            <div class="signature-area">
+              <div>
+                <div style="font-size: 8px; color: #666; text-transform: uppercase;">Authorized Declaration</div>
+                <div style="font-size: 8px; color: #333; margin-top: 2px;">Verified by AI Extractor v4.2</div>
+              </div>
+              <div style="text-align: right;">
+                <div class="signature-img">J. Harrison</div>
+                <div style="font-size: 8px; color: #666; border-top: 1px solid #aaa; padding-top: 2px; width: 100px;">Authorized Officer</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Thumbnails Selector -->
+        <div class="thumbnail-bar">
+          <div class="thumb-btn active">
+            <div class="thumb-mini-paper">
+              <div class="thumb-line"></div>
+              <div class="thumb-line"></div>
+              <div class="thumb-line"></div>
+            </div>
+            <span class="thumb-num">1</span>
+          </div>
+          <div class="thumb-btn">
+            <div class="thumb-mini-paper">
+              <div class="thumb-line"></div>
+              <div class="thumb-line"></div>
+            </div>
+            <span class="thumb-num">2</span>
+          </div>
+          <div class="thumb-btn">
+            <div class="thumb-mini-paper">
+              <div class="thumb-line"></div>
+              <div class="thumb-line"></div>
+            </div>
+            <span class="thumb-num">3</span>
+          </div>
+          <div class="thumb-btn">
+            <div class="thumb-mini-paper">
+              <div class="thumb-line"></div>
+            </div>
+            <span class="thumb-num">4</span>
+          </div>
+          <div class="thumb-btn">
+            <div class="thumb-mini-paper">
+              <div class="thumb-line"></div>
+            </div>
+            <span class="thumb-num">5</span>
+          </div>
+        </div>
+
+        <!-- Bottom Zoom Toolbar -->
+        <div class="doc-toolbar">
+          <button class="icon-btn" title="Zoom Out"><i data-lucide="minus"></i></button>
+          <span class="zoom-text">100%</span>
+          <button class="icon-btn" title="Zoom In"><i data-lucide="plus"></i></button>
+          <button class="icon-btn" title="Fit Page"><i data-lucide="maximize-2"></i></button>
+          <button class="icon-btn" title="Download Document"><i data-lucide="download"></i></button>
+        </div>
+      </section>
+
+
+      <!-- COLUMN 2: INVOICES (5) -->
+      <section class="column-card col-invoices">
+        <div class="card-header">
+          <div class="card-header-title">
+            <i data-lucide="files"></i>
+            <span>Invoices (5)</span>
+          </div>
+          <button class="icon-btn" title="Filter"><i data-lucide="sliders-horizontal"></i></button>
+        </div>
+
+        <div class="invoices-list">
+
+          <!-- Card 1 (SELECTED) -->
+          <div class="invoice-card selected">
+            <div class="card-top">
+              <div class="invoice-num-group">
+                <div class="doc-file-icon"><i data-lucide="file-text" size="18"></i></div>
+                <div>
+                  <div class="invoice-title">Invoice #67891234</div>
+                  <div class="vendor-name">DHL Express</div>
+                </div>
+              </div>
+              <div class="confidence-badge">
+                <span class="confidence-dot"></span>
+                98%
+              </div>
+            </div>
+            <div class="card-bottom">
+              <span>May 16, 2024 • 12 pages</span>
+            </div>
+          </div>
+
+          <!-- Card 2 -->
+          <div class="invoice-card">
+            <div class="card-top">
+              <div class="invoice-num-group">
+                <div class="doc-file-icon" style="color:#8FA0BD; background:rgba(255,255,255,0.05);"><i data-lucide="file-text" size="18"></i></div>
+                <div>
+                  <div class="invoice-title">Invoice #67891011</div>
+                  <div class="vendor-name">FedEx Trade Networks</div>
+                </div>
+              </div>
+              <div class="confidence-badge">
+                <span class="confidence-dot"></span>
+                95%
+              </div>
+            </div>
+            <div class="card-bottom">
+              <span>May 15, 2024 • 8 pages</span>
+            </div>
+          </div>
+
+          <!-- Card 3 (WARNING) -->
+          <div class="invoice-card">
+            <div class="card-top">
+              <div class="invoice-num-group">
+                <div class="doc-file-icon" style="color:#F5B83D; background:rgba(245, 184, 61, 0.1);"><i data-lucide="file-warning" size="18"></i></div>
+                <div>
+                  <div class="invoice-title">Invoice #67890578</div>
+                  <div class="vendor-name">UPS Supply Chain Solutions</div>
+                </div>
+              </div>
+              <div class="confidence-badge" style="color:#F5B83D; background:rgba(245, 184, 61, 0.1); border-color:rgba(245, 184, 61, 0.2);">
+                <span class="confidence-dot" style="background-color:#F5B83D;"></span>
+                62%
+              </div>
+            </div>
+            <div class="warning-pill">
+              <i data-lucide="alert-triangle" size="12"></i>
+              Poor Image Quality
+            </div>
+            <div class="card-bottom">
+              <span>May 14, 2024 • 16 pages</span>
+            </div>
+          </div>
+
+          <!-- Card 4 -->
+          <div class="invoice-card">
+            <div class="card-top">
+              <div class="invoice-num-group">
+                <div class="doc-file-icon" style="color:#8FA0BD; background:rgba(255,255,255,0.05);"><i data-lucide="file-text" size="18"></i></div>
+                <div>
+                  <div class="invoice-title">Invoice #67889901</div>
+                  <div class="vendor-name">DB Schenker</div>
+                </div>
+              </div>
+              <div class="confidence-badge">
+                <span class="confidence-dot"></span>
+                93%
+              </div>
+            </div>
+            <div class="card-bottom">
+              <span>May 13, 2024 • 9 pages</span>
+            </div>
+          </div>
+
+          <!-- Card 5 -->
+          <div class="invoice-card">
+            <div class="card-top">
+              <div class="invoice-num-group">
+                <div class="doc-file-icon" style="color:#8FA0BD; background:rgba(255,255,255,0.05);"><i data-lucide="file-text" size="18"></i></div>
+                <div>
+                  <div class="invoice-title">Invoice #67888742</div>
+                  <div class="vendor-name">Kuehne+Nagel</div>
+                </div>
+              </div>
+              <div class="confidence-badge">
+                <span class="confidence-dot"></span>
+                91%
+              </div>
+            </div>
+            <div class="card-bottom">
+              <span>May 12, 2024 • 10 pages</span>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+
+      <!-- COLUMN 3: FORM REVIEW -->
+      <section class="column-card col-form">
+        <div class="card-header">
+          <div class="card-header-title">
+            <span>Invoice 1 of 5</span>
+            <div class="arrow-btns">
+              <button class="icon-btn" title="Previous Invoice"><i data-lucide="chevron-left"></i></button>
+              <button class="icon-btn" title="Next Invoice"><i data-lucide="chevron-right"></i></button>
+            </div>
+          </div>
+          <div class="status-ready-pill">
+            <i data-lucide="check-circle-2" size="14"></i>
+            Ready
+          </div>
+        </div>
+
+        <!-- Tab Bar -->
+        <div class="tab-bar">
+          <div class="tab-item active">Invoice Header</div>
+          <div class="tab-item">Line Items</div>
+          <div class="tab-item">Totals</div>
+          <div class="tab-item">Parties</div>
+          <div class="tab-item">Notes</div>
+        </div>
+
+        <!-- Form Content -->
+        <div class="form-content">
+
+          <!-- Row 1 -->
+          <div class="form-grid-2">
+            <div class="field-group">
+              <label class="field-label">Invoice ID</label>
+              <input type="text" class="form-input" value="INV-67891234" readonly>
+            </div>
+            <div class="field-group">
+              <label class="field-label">Invoice Number</label>
+              <input type="text" class="form-input" value="67891234">
+            </div>
+          </div>
+
+          <!-- Row 2 -->
+          <div class="form-grid-2">
+            <div class="field-group">
+              <label class="field-label">Invoice Date</label>
+              <div class="input-wrapper">
+                <input type="text" class="form-input" value="May 16, 2024">
+                <i data-lucide="calendar" size="16"></i>
+              </div>
+            </div>
+            <div class="field-group">
+              <label class="field-label">Terms of Sale</label>
+              <input type="text" class="form-input" value="DDP">
+            </div>
+          </div>
+
+          <!-- Row 3 -->
+          <div class="form-grid-2">
+            <div class="field-group">
+              <label class="field-label">Currency</label>
+              <div class="input-wrapper">
+                <input type="text" class="form-input" value="USD">
+                <i data-lucide="chevron-down" size="16"></i>
+              </div>
+            </div>
+            <div class="field-group">
+              <label class="field-label">Shipment Reference</label>
+              <input type="text" class="form-input" value="SO-23891">
+            </div>
+          </div>
+
+          <!-- Section: Shipper -->
+          <div class="section-box">
+            <div class="section-title">
+              <i data-lucide="building-2" size="14"></i>
+              Shipper
+            </div>
+            <div class="field-group">
+              <label class="field-label">Name</label>
+              <input type="text" class="form-input" value="Apex Manufacturing Inc.">
+            </div>
+            <div class="field-group">
+              <label class="field-label">Address</label>
+              <input type="text" class="form-input" value="123 Industrial Way, Detroit, MI 48201, USA">
+            </div>
+          </div>
+
+          <!-- Section: Consignee -->
+          <div class="section-box">
+            <div class="section-title">
+              <i data-lucide="map-pin" size="14"></i>
+              Consignee
+            </div>
+            <div class="field-group">
+              <label class="field-label">Name</label>
+              <input type="text" class="form-input" value="Global Parts Ltd.">
+            </div>
+            <div class="field-group">
+              <label class="field-label">Address</label>
+              <input type="text" class="form-input" value="456 Logistics Park, Hamburg, 20095, Germany">
+            </div>
+          </div>
+
+          <!-- Right-aligned Numeric Totals -->
+          <div class="field-group">
+            <label class="field-label text-right">Total Packages</label>
+            <input type="text" class="form-input text-right" value="200">
+          </div>
+
+          <div class="field-group">
+            <label class="field-label text-right">Total Net Weight (KG)</label>
+            <input type="text" class="form-input text-right" value="850.00">
+          </div>
+
+          <div class="field-group">
+            <label class="field-label text-right" style="color: var(--accent-blue);">Total Invoice Value (USD)</label>
+            <input type="text" class="form-input text-right focused-glow" value="24,000.00" style="font-weight: 700; font-size: 15px; color: var(--text-white);">
+          </div>
+
+        </div>
+
+        <!-- Bottom Save Button -->
+        <div class="form-footer">
+          <button class="btn-save">
+            <i data-lucide="save" size="18"></i>
+            Save Changes
+          </button>
+        </div>
+      </section>
+
+    </main>
+
+  </div>
+
+  <script>
+    // Initialize Lucide icons
+    lucide.createIcons();
+  </script>
+</body>
+</html>
