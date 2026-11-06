@@ -1,0 +1,1861 @@
+import React, { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { apiGetJson, normalizeApiCacheUrl } from './dataCache.js';
+import { UploadMultiView, MultiInvoiceWorkspace, InvoiceNavigator, ExtractionProcessingPanel, InvoiceExtractionAction, triggerInvoiceExtraction, getInvoicePoorImageState } from './MultiInvoiceViews.jsx';
+import { Escalations } from './Escalations.jsx';
+import { EscalationModal } from './EscalationModal.jsx';
+import { PreviewRange } from './PreviewRange.jsx';
+import { BackButton } from './BackButton.jsx';
+import { getDocumentReviewPath } from './reviewRouting.js';
+import { getInvoiceQualityReasonLabel } from './invoiceQualityReasons.js';
+
+const API = '/api';
+
+class RouteErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false };
+  }
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error) {
+    console.error('Route render error', error);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return <main className="page"><div className="card empty-state">Unable to render this page. Refresh and try again.</div></main>;
+    }
+    return this.props.children;
+  }
+}
+
+const defaultCustomer = {
+  name: 'Apex Freight Logistics',
+  code: 'APEX',
+  primaryColor: '#0B8FD3',
+};
+
+const normalizeStatus = (status) => {
+  const safe = status || 'PENDING';
+  const lookup = {
+    EXTRACTED: 'success',
+    IN_REVIEW: 'warning',
+    APPROVED: 'success',
+    INVOICE_GENERATED: 'success',
+    PENDING: 'warning',
+    PREPROCESSED: 'warning',
+    FAILED: 'danger',
+  };
+  return lookup[safe] || 'neutral';
+};
+
+const fetchJson = async (url, options = {}) => {
+  const normalizedUrl = normalizeApiCacheUrl(url);
+  const response = await fetch(normalizedUrl, { cache: 'no-store', ...options });
+  return response;
+};
+
+const isRealInvoicePayload = (obj) => {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
+  return Boolean(
+    obj.invoiceHeader ||
+    obj.shipmentDetails ||
+    obj.shipmentDetail ||
+    obj.chargeLineItems ||
+    obj.header ||
+    obj.invoiceNumber ||
+    obj.invoice_number ||
+    obj.invoiceNo ||
+    obj.invoiceId ||
+    obj.documentNumber ||
+    obj.shipperName ||
+    obj.vendorName ||
+    obj.consigneeName ||
+    obj.billToName ||
+    obj.totalAmountDue ||
+    obj.totalAmount
+  );
+};
+
+const parseStoredInvoiceData = (invoice) => {
+  const unwrap = (value) => {
+    let current = value;
+    if (typeof current === 'string') {
+      try { current = JSON.parse(current); } catch (error) { return {}; }
+    }
+    if (!current || typeof current !== 'object' || Array.isArray(current)) return {};
+
+    if (current.extractedData) {
+      const inner = unwrap(current.extractedData);
+      if (isRealInvoicePayload(inner)) return inner;
+    }
+    if (current.canonicalJson) {
+      const inner = unwrap(current.canonicalJson);
+      if (isRealInvoicePayload(inner)) return inner;
+    }
+    if (current.data) {
+      const inner = unwrap(current.data);
+      if (isRealInvoicePayload(inner)) return inner;
+    }
+    if (current.json) {
+      const inner = unwrap(current.json);
+      if (isRealInvoicePayload(inner)) return inner;
+    }
+
+    if (isRealInvoicePayload(current)) return current;
+    return {};
+  };
+
+  const fromExtracted = unwrap(invoice?.extractedData);
+  if (isRealInvoicePayload(fromExtracted)) return fromExtracted;
+
+  const fromCanonical = unwrap(invoice?.canonicalJson);
+  if (isRealInvoicePayload(fromCanonical)) return fromCanonical;
+
+  const fromFinal = unwrap(invoice?.finalSubmittedData);
+  if (isRealInvoicePayload(fromFinal)) return fromFinal;
+
+  return {};
+};
+
+const hasStoredInvoiceData = (invoice) => isRealInvoicePayload(parseStoredInvoiceData(invoice));
+
+const getSingleInvoiceData = (document) => {
+  if (!document) return {};
+  const candidates = [
+    document?.invoices?.[0],
+    document?.extraction,
+    document,
+  ];
+  for (const candidate of candidates) {
+    const data = parseStoredInvoiceData(candidate);
+    if (isRealInvoicePayload(data)) return data;
+  }
+  return {};
+};
+
+const getInvoiceHeader = (invoice) => {
+  const data = parseStoredInvoiceData(invoice);
+  return data.invoiceHeader && typeof data.invoiceHeader === 'object' && !Array.isArray(data.invoiceHeader)
+    ? data.invoiceHeader
+    : data;
+};
+
+const getInvoiceLabel = (invoice) => {
+  const header = getInvoiceHeader(invoice);
+  return invoice?.invoiceNumber || header.invoiceNumber || header.invoiceId || header.documentNumber || header.invoiceNo || 'Invoice details';
+};
+
+const getInvoiceTotal = (invoice) => {
+  const header = getInvoiceHeader(invoice);
+  return header.totalAmountDue ?? header.totalAmount ?? header.total ?? null;
+};
+
+const getInvoiceDate = (invoice) => {
+  const header = getInvoiceHeader(invoice);
+  return header.invoiceDate ?? header.date ?? null;
+};
+
+const getInvoiceCurrency = (invoice) => {
+  const header = getInvoiceHeader(invoice);
+  return header.currency ?? null;
+};
+
+const RouteSkeleton = ({ label = 'Loading page...' }) => (
+  <main className="page route-skeleton" aria-busy="true">
+    <div className="skeleton-line skeleton-line-wide" />
+    <div className="skeleton-line" />
+    <div className="skeleton-panel"><span>{label}</span></div>
+  </main>
+);
+
+const invoiceSections = (data) => {
+  // Mirror the same key detection used in MultiInvoiceDetailView:
+  // prefer 'shipmentDetails' (plural), fall back to 'shipmentDetail' (singular).
+  const shipmentKey = Array.isArray(data?.shipmentDetails) ? 'shipmentDetails' : 'shipmentDetail';
+  const shipments = Array.isArray(data?.[shipmentKey]) ? data[shipmentKey] : [];
+  const nestedCharges = shipments.flatMap((shipment) => Array.isArray(shipment?.chargeLineItems) ? shipment.chargeLineItems : []);
+  const charges = [...nestedCharges, ...(Array.isArray(data?.chargeLineItems) ? data.chargeLineItems : [])];
+  return {
+    header: data?.invoiceHeader && typeof data.invoiceHeader === 'object' ? data.invoiceHeader : {},
+    shipments,
+    shipmentKey,
+    charges,
+  };
+};
+
+const InvoiceExtractionCard = ({ invoice, isActive, onSelect }) => {
+  const initialData = parseStoredInvoiceData(invoice);
+  const [draft, setDraft] = useState(initialData);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState('');
+  const [activeSheet, setActiveSheet] = useState('header');
+  const cardRef = useRef(null);
+  const sections = useMemo(() => invoiceSections(draft), [draft]);
+  const sheetDefinitions = [
+    { id: 'header', label: 'Invoice Header', value: sections.header, path: ['invoiceHeader'] },
+    { id: 'shipments', label: 'Shipments', value: sections.shipments, path: [sections.shipmentKey] },
+    { id: 'charges', label: 'Charge Line Items', value: sections.charges, path: ['chargeLineItems'] },
+  ];
+  const activeSheetDefinition = sheetDefinitions.find((sheet) => sheet.id === activeSheet) || sheetDefinitions[0];
+
+  useEffect(() => {
+    setDraft(parseStoredInvoiceData(invoice));
+    setActiveSheet('header');
+  }, [invoice]);
+
+  useEffect(() => {
+    if (isActive) cardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }, [isActive]);
+
+  const updatePath = (parts, value) => {
+    setDraft((current) => {
+      const next = JSON.parse(JSON.stringify(current || {}));
+      let target = next;
+      parts.slice(0, -1).forEach((part) => { target = target[part]; });
+      target[parts[parts.length - 1]] = value;
+      return next;
+    });
+  };
+
+  const renderEditable = (value, label, parts) => {
+    if (Array.isArray(value)) {
+      return <div className="invoice-card-record-list" key={parts.join('.')}>
+        {value.length === 0 ? <div className="subtle-copy">No records found</div> : value.map((item, index) => (
+          <div className="invoice-card-record" key={`${parts.join('.')}-${index}`}>
+            <div className="field-label">{label} {index + 1}</div>
+            {renderEditable(item, '', [...parts, index])}
+          </div>
+        ))}
+      </div>;
+    }
+    if (value && typeof value === 'object') {
+      return <div className="invoice-card-fields" key={parts.join('.')}>
+        {Object.entries(value).map(([key, child]) => renderEditable(child, key, [...parts, key]))}
+      </div>;
+    }
+    return <label className="invoice-card-field" key={parts.join('.')}>
+      <span>{label || parts[parts.length - 1]}</span>
+      <input value={value === null || value === undefined ? '' : String(value)} onChange={(event) => updatePath(parts, event.target.value)} />
+    </label>;
+  };
+
+  const save = async () => {
+    setSaving(true);
+    setSaveError('');
+    try {
+      const response = await fetch(`${API}/documents/${invoice.documentId}/review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ invoiceId: invoice.id || invoice.invoiceId, editedData: draft }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to save invoice.');
+    } catch (error) {
+      setSaveError(error.message || 'Unable to save invoice.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <article ref={cardRef} className={`invoice-extraction-card ${isActive ? 'is-active' : ''}`} data-invoice-card={invoice.invoiceIndex} onClick={onSelect}>
+      <div className="invoice-card-heading">
+        <div>
+          <span className="eyebrow">Invoice {Number(invoice.invoiceIndex ?? 0) + 1}</span>
+          <h2>{getInvoiceLabel({ ...invoice, extractedData: draft })}</h2>
+          <span className="subtle-copy">Pages {invoice.pageStart ?? 'N/A'}-{invoice.pageEnd ?? 'N/A'}</span>
+        </div>
+        <div className="invoice-card-meta">
+          <span className="status-pill success">{invoice.status || invoice.extractionStatus || 'EXTRACTED'}</span>
+          <span className="confidence-badge">Confidence {invoice.overallConfidence ?? 'N/A'}</span>
+          <button type="button" className="secondary-btn" onClick={(event) => { event.stopPropagation(); save(); }} disabled={saving}>{saving ? 'Saving...' : 'Save'}</button>
+        </div>
+      </div>
+      {saveError && <div className="invoice-card-error">{saveError}</div>}
+      {Object.keys(draft).length === 0 ? <div className="empty-state">Extraction data unavailable.</div> : (
+        <>
+          <div className="invoice-card-tabs" role="tablist" aria-label={`Invoice ${Number(invoice.invoiceIndex ?? 0) + 1} sheets`}>
+            {sheetDefinitions.map((sheet) => <button key={sheet.id} type="button" role="tab" aria-selected={activeSheet === sheet.id} className={activeSheet === sheet.id ? 'primary-btn' : 'secondary-btn'} onClick={(event) => { event.stopPropagation(); setActiveSheet(sheet.id); }}>{sheet.label}</button>)}
+          </div>
+          <div className="invoice-card-sections">
+            <section><h3>{activeSheetDefinition.label}</h3>{renderEditable(activeSheetDefinition.value, activeSheetDefinition.label, activeSheetDefinition.path)}</section>
+          </div>
+        </>
+      )}
+      {invoice.confidenceScores && <div className="invoice-card-confidence"><strong>Confidence scores</strong><span>{Object.entries(invoice.confidenceScores).map(([key, value]) => `${key}: ${value}`).join(' | ')}</span></div>}
+    </article>
+  );
+};
+
+const DocumentPage = ({ docId, pageNumber, invoiceIndex, active, onVisible }) => {
+  const pageRef = useRef(null);
+  useEffect(() => {
+    const node = pageRef.current;
+    if (!node || !window.IntersectionObserver) return undefined;
+    const observer = new IntersectionObserver(([entry]) => { if (entry.isIntersecting) onVisible(invoiceIndex); }, { threshold: 0.45 });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [invoiceIndex, onVisible]);
+  return (
+    <section ref={pageRef} className={`document-page ${active ? 'is-active' : ''}`} data-page-number={pageNumber}>
+      <div className="document-page-label">Invoice {invoiceIndex + 1} - Page {pageNumber}</div>
+      <iframe src={`${API}/documents/${docId}/file#page=${pageNumber}`} title={`Document page ${pageNumber}`} />
+    </section>
+  );
+};
+
+function App() {
+  const [customer, setCustomer] = useState(defaultCustomer);
+  const [documents, setDocuments] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
+  const [path, setPath] = useState(window.location.pathname + window.location.search);
+  const [deleteTarget, setDeleteTarget] = useState(null);
+  const [deletingId, setDeletingId] = useState(null);
+  const [toast, setToast] = useState(null);
+
+  const cancelDeleteRef = useRef(null);
+
+  useEffect(() => {
+    const onPop = () => setPath(window.location.pathname + window.location.search);
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
+
+  useEffect(() => {
+    const onClick = (event) => {
+      const anchor = event.target?.closest?.('a[href]');
+      if (!anchor) return;
+      const href = anchor.getAttribute('href');
+      if (!href || href.startsWith('#') || href.startsWith('http') || href.startsWith('mailto:') || anchor.target === '_blank') return;
+      const routeUrl = new URL(href, window.location.origin);
+      if (routeUrl.origin !== window.location.origin) return;
+      if (routeUrl.pathname === window.location.pathname && routeUrl.search === window.location.search) return;
+      event.preventDefault();
+      window.history.pushState({}, '', routeUrl.pathname + routeUrl.search);
+      setPath(routeUrl.pathname + routeUrl.search);
+    };
+    document.addEventListener('click', onClick);
+    return () => document.removeEventListener('click', onClick);
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    fetchJson(`${API}/customer`)
+      .then(async (response) => {
+        if (!response.ok) throw new Error('Unable to load customer data.');
+        const data = await response.json();
+        if (active && data.customer) setCustomer(data.customer);
+      })
+      .catch((error) => {
+        if (active) {
+          setLoadError(error.message || 'Unable to load customer data.');
+          console.error('Customer load error', error);
+        }
+      });
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    const pathname = path.split('?')[0];
+    if (pathname === '/escalations') {
+      setLoading(false);
+      return () => { active = false; };
+    }
+    const documentsUrl = pathname === '/invoices' || pathname === '/flagged'
+      ? `${API}/documents`
+      : `${API}/documents?summary=true&refresh=${Date.now()}`;
+    fetchJson(documentsUrl)
+      .then(async (response) => {
+        if (!response.ok) throw new Error('Unable to load document data.');
+        const data = await response.json();
+        if (active) setDocuments(data.documents || []);
+      })
+      .catch((error) => {
+        if (active) {
+          setLoadError(error.message || 'Unable to load document data.');
+          console.error('Document load error', error);
+        }
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => { active = false; };
+  }, [path]);
+
+  const route = useMemo(() => {
+    const pathname = path.split('?')[0];
+    if (pathname === '/escalations') return 'escalations';
+    if (pathname === '/flagged') return 'flagged';
+    if (pathname === '/preview') return 'preview';
+    if (pathname === '/documents/upload') return 'upload';
+    if (pathname === '/documents/upload-multi') return 'upload-multi';
+    if (pathname.startsWith('/documents/') && pathname.endsWith('/multi-workspace')) return 'multi-workspace';
+    if (pathname.startsWith('/batch-workspace')) return 'batch-workspace';
+    if (pathname.startsWith('/review-multi/')) return 'review-multi';
+    if (pathname.startsWith('/documents/') && pathname.includes('/invoices/')) return 'multi-invoice-detail';
+    if (pathname.startsWith('/documents/') && pathname.endsWith('/invoices')) return 'multi-invoice-list';
+    if (pathname.startsWith('/documents/') && pathname.includes('/review')) return 'review';
+    if (pathname.startsWith('/invoices/') && pathname.split('/').length > 2) return 'invoice';
+    if (pathname === '/invoices') return 'invoices';
+    if (pathname === '/review-queue') return 'queue';
+    return 'documents';
+  }, [path]);
+
+  useEffect(() => {
+    if (route === 'review' || route === 'multi-workspace') {
+      window.scrollTo(0, 0);
+    }
+  }, [path, route]);
+
+  const nav = (
+    <header className="topbar">
+      <div className="topbar-inner">
+        <div className="brand-wrap">
+          <div className="logo-badge" style={{ background: customer.primaryColor || defaultCustomer.primaryColor }}>🚚</div>
+          <div className="brand-meta">
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              <span className="brand-name">{customer.name || defaultCustomer.name}</span>
+              <span
+                className="status-pill success"
+                style={{ background: customer.primaryColor || defaultCustomer.primaryColor, color: '#fff', border: 'none', padding: '0.25rem 0.55rem' }}
+              >
+                {customer.code || 'APEX'}
+              </span>
+            </div>
+            <span className="brand-tag">Document Automation Engine</span>
+          </div>
+        </div>
+
+        <nav className="main-nav">
+          <a href="/" className="nav-link">Dashboard</a>
+          <a href="/documents" className="nav-link">Documents</a>
+          <a href="/escalations" className="nav-link">Escalations</a>
+          <a href="/preview" className="nav-link">Preview</a>
+          <a href="/documents/upload" className="nav-link">Invoice Intake</a>
+          <a href="/review-queue" className="nav-link">Review Queue</a>
+          <a href="/invoices" className="nav-link">Invoices</a>
+        </nav>
+      </div>
+    </header>
+  );
+
+  const deleteDocument = async (docId) => {
+    const docToDelete = documents.find((doc) => doc.id === docId);
+    if (!docToDelete) return;
+
+    const confirmed = window.confirm(`Delete "${docToDelete.fileName}"? This action cannot be undone.`);
+    if (!confirmed) return;
+
+    try {
+      const res = await fetch(`${API}/documents/${docId}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'Delete failed');
+      }
+
+      setDocuments((current) => current.filter((doc) => doc.id !== docId));
+    } catch (error) {
+      alert(error.message || 'Unable to delete document.');
+    }
+  };
+
+  useEffect(() => {
+    if (!toast) return;
+    const timer = window.setTimeout(() => setToast(null), 3000);
+    return () => window.clearTimeout(timer);
+  }, [toast]);
+
+  useEffect(() => {
+    if (!deleteTarget) return;
+
+    const handleEscape = (event) => {
+      if (event.key === 'Escape' && !deletingId) {
+        setDeleteTarget(null);
+      }
+    };
+
+    const focusTimer = window.setTimeout(() => cancelDeleteRef.current?.focus(), 0);
+    window.addEventListener('keydown', handleEscape);
+
+    return () => {
+      window.clearTimeout(focusTimer);
+      window.removeEventListener('keydown', handleEscape);
+    };
+  }, [deleteTarget, deletingId]);
+
+  const openDeleteModal = (doc) => setDeleteTarget(doc);
+
+  const openDocumentReview = async (event, doc) => {
+    event.preventDefault();
+    event.stopPropagation();
+    try {
+      const response = await fetchJson(
+        `${API}/documents/${encodeURIComponent(doc.id)}/invoices?refresh=${Date.now()}`
+      );
+      if (!response.ok) throw new Error("Unable to check this document's invoices.");
+      const data = await response.json();
+      const invoiceCount = Math.max(
+        Number(doc.invoiceCount) || 0,
+        Number(data.invoiceCount) || 0
+      );
+      const target = getDocumentReviewPath(
+        { ...doc, invoiceCount },
+        Array.isArray(data.invoices) ? data.invoices : []
+      );
+      window.history.pushState({}, '', target);
+      setPath(target);
+    } catch (error) {
+      alert(error.message || 'Unable to open this document for review.');
+    }
+  };
+
+  const handleDeleteDocument = async () => {
+    if (!deleteTarget || deletingId) return;
+
+    setDeletingId(deleteTarget.id);
+    try {
+      const res = await fetch(`${API}/documents/${deleteTarget.id}`, { method: 'DELETE' });
+      const data = await res.json();
+
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'Unable to delete document.');
+      }
+
+      setDocuments((current) => current.filter((doc) => doc.id !== deleteTarget.id));
+      setDeleteTarget(null);
+      setToast({ type: 'success', message: 'Document deleted successfully.' });
+    } catch (error) {
+      setToast({ type: 'error', message: error.message || 'Unable to delete document.' });
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  const renderDocumentsView = () => {
+    const rows = documents.map((doc) => {
+      const docStatus = doc.status || 'PENDING';
+      const hasLowVisualQuality = (doc.imageQuality != null && Number(doc.imageQuality) < 0.6)
+        || (doc.invoices || []).some((invoice) => invoice.imageQuality != null && Number(invoice.imageQuality) < 0.6);
+      const needsReview = hasLowVisualQuality
+        || ['NEEDS_REVIEW', 'POOR_IMAGE_QUALITY', 'POOR IMAGE QUALITY'].includes(String(docStatus).toUpperCase())
+        || doc.poorImageQuality === true;
+      const displayStatus = hasLowVisualQuality ? 'Poor Image Quality' : needsReview ? 'Needs Review' : docStatus;
+      const statusClass = hasLowVisualQuality ? 'danger' : needsReview ? 'warning' : normalizeStatus(docStatus);
+      return (
+        <tr key={doc.id}>
+          <td>{doc.fileName}</td>
+          <td><span className="status-pill neutral">{doc.documentType || 'Document'}</span></td>
+          <td><span className={`status-pill ${statusClass}`}>{displayStatus}</span></td>
+          <td>{((doc.fileSize || 0) / 1024).toFixed(1)} KB</td>
+          <td>{new Date(doc.createdAt).toLocaleDateString()}</td>
+          <td style={{ textAlign: 'right' }}>
+            <a href={getDocumentReviewPath(doc)} onClick={(event) => openDocumentReview(event, doc)} className="nav-link" style={{ padding: '0.4rem 0.6rem', display: 'inline-flex' }}>
+              Review & Edit
+            </a>
+            <button
+              type="button"
+              className="nav-link"
+              style={{ padding: '0.4rem 0.6rem', display: 'inline-flex', marginLeft: '0.25rem' }}
+              onClick={() => openDeleteModal(doc)}
+            >
+              Delete
+            </button>
+            {doc.status === 'INVOICE_GENERATED' && (
+              <a href={`/invoices/${doc.id}`} className="nav-link" style={{ padding: '0.4rem 0.6rem', display: 'inline-flex', marginLeft: '0.25rem' }}>
+                View Invoice
+              </a>
+            )}
+            {(doc.invoices || []).length > 1 && (
+              <a href={`/documents/${doc.id}/invoices`} className="nav-link" style={{ padding: '0.4rem 0.6rem', display: 'inline-flex', marginLeft: '0.25rem' }}>
+                View Invoices
+              </a>
+            )}
+          </td>
+        </tr>
+      );
+    });
+
+    return (
+      <>
+        {deleteTarget && (
+          <div
+            style={{
+              position: 'fixed',
+              inset: 0,
+              background: 'rgba(15, 23, 42, 0.6)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              zIndex: 1000,
+              padding: '1rem'
+            }}
+            onClick={() => !deletingId && setDeleteTarget(null)}
+          >
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="delete-document-title"
+              onClick={(event) => event.stopPropagation()}
+              style={{
+                width: '100%',
+                maxWidth: '420px',
+                background: '#ffffff',
+                borderRadius: '18px',
+                border: '1px solid #e2e8f0',
+                boxShadow: '0 24px 60px rgba(15, 23, 42, 0.26)',
+                padding: '1.5rem'
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1rem' }}>
+                <div id="delete-document-title" style={{ fontSize: '1.15rem', fontWeight: 700, color: '#0f172a' }}>Delete document</div>
+                <button
+                  type="button"
+                  aria-label="Close delete dialog"
+                  disabled={deletingId}
+                  onClick={() => setDeleteTarget(null)}
+                  style={{
+                    background: 'transparent',
+                    border: 'none',
+                    color: '#64748b',
+                    fontSize: '1.5rem',
+                    cursor: deletingId ? 'not-allowed' : 'pointer',
+                    lineHeight: 1
+                  }}
+                >
+                  ×
+                </button>
+              </div>
+
+              <p style={{ margin: '0 0 0.5rem', color: '#334155', fontSize: '1rem' }}>Are you sure you want to delete this document?</p>
+              <div style={{ marginBottom: '0.75rem', padding: '0.75rem 0.9rem', background: '#f8fafc', borderRadius: '10px', border: '1px solid #e2e8f0', color: '#0f172a', fontWeight: 600, wordBreak: 'break-word' }}>
+                {deleteTarget.fileName}
+              </div>
+              <p style={{ margin: '0 0 1.2rem', color: '#ef4444', fontWeight: 600, fontSize: '0.9rem' }}>This action cannot be undone.</p>
+
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem' }}>
+                <button
+                  ref={cancelDeleteRef}
+                  type="button"
+                  onClick={() => setDeleteTarget(null)}
+                  disabled={deletingId}
+                  style={{
+                    background: '#e2e8f0',
+                    border: '1px solid #cbd5e1',
+                    color: '#0f172a',
+                    borderRadius: '10px',
+                    padding: '0.75rem 1rem',
+                    fontWeight: 600,
+                    cursor: deletingId ? 'not-allowed' : 'pointer',
+                    opacity: deletingId ? 0.7 : 1
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDeleteDocument}
+                  disabled={deletingId === deleteTarget.id}
+                  style={{
+                    background: '#dc2626',
+                    border: '1px solid #b91c1c',
+                    color: '#ffffff',
+                    borderRadius: '10px',
+                    padding: '0.75rem 1rem',
+                    fontWeight: 700,
+                    cursor: deletingId === deleteTarget.id ? 'not-allowed' : 'pointer',
+                    opacity: deletingId === deleteTarget.id ? 0.85 : 1,
+                    minWidth: '150px'
+                  }}
+                >
+                  {deletingId === deleteTarget.id ? 'Deleting...' : 'Delete Document'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {toast && (
+          <div
+            role="status"
+            aria-live="polite"
+            style={{
+              position: 'fixed',
+              right: '1.25rem',
+              bottom: '1.25rem',
+              zIndex: 1100,
+              minWidth: '260px',
+              maxWidth: '360px',
+              padding: '0.9rem 1rem',
+              borderRadius: '12px',
+              background: toast.type === 'success' ? '#166534' : '#991b1b',
+              color: '#ffffff',
+              boxShadow: '0 16px 40px rgba(15, 23, 42, 0.25)',
+              fontWeight: 600
+            }}
+          >
+            {toast.message}
+          </div>
+        )}
+
+        <main className="page dashboard-shell">
+          <div className="section-header">
+            <div>
+              <div className="eyebrow">Overview</div>
+              <h1 className="page-title">Documents Repository</h1>
+              <p className="subtle-copy mt-2">View and manage ingested logistics paperwork.</p>
+            </div>
+            <a href="/documents/upload" className="primary-btn">+ Invoice Intake</a>
+          </div>
+
+          <div className="card table-card">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Filename</th>
+                  <th>Type</th>
+                  <th>Status</th>
+                  <th>Size</th>
+                  <th>Uploaded At</th>
+                  <th style={{ textAlign: 'right' }}>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {loading ? (
+                  <tr><td colSpan="6"><div className="empty-state">Loading documents...</div></td></tr>
+                ) : rows.length > 0 ? rows : (
+                  <tr><td colSpan="6"><div className="empty-state">No documents found. Upload one to get started.</div></td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </main>
+      </>
+    );
+  };
+
+  const UploadView = () => {
+    const [selectedFiles, setSelectedFiles] = useState([]);
+    const [uploading, setUploading] = useState(false);
+    const [statusText, setStatusText] = useState('');
+
+    const handleFiles = (files) => {
+      if (!files || !files.length) return;
+      setSelectedFiles(Array.from(files));
+    };
+
+    const handleUpload = async () => {
+      if (!selectedFiles.length) {
+        alert('Please select document files first.');
+        return;
+      }
+
+      setUploading(true);
+      setStatusText('Uploading document(s) and storing them securely...');
+
+      const formData = new FormData();
+      selectedFiles.forEach((file) => formData.append('file', file));
+
+      try {
+        const res = await fetchJson(`${API}/documents/upload`, { method: 'POST', body: formData });
+        const data = await res.json();
+        if (data.success && data.documentIds && data.documentIds.length > 0) {
+          const firstDocId = data.documentIds[0];
+          const firstDispatch = (data.dispatches || []).find((dispatch) => dispatch.documentId === firstDocId);
+          const invoiceCount = Number(firstDispatch?.invoiceCount || 1);
+          const isPdfUpload = selectedFiles.some((file) => file.name.toLowerCase().endsWith('.pdf'));
+          const target = data.documentIds.length > 1
+            ? `/batch-workspace?ids=${data.documentIds.join(',')}`
+            : invoiceCount > 1 || isPdfUpload
+              ? `/documents/${firstDocId}/multi-workspace?expectedInvoices=${encodeURIComponent(invoiceCount)}`
+              : `/documents/${firstDocId}/review`;
+          setStatusText('Upload complete. No extraction has started.');
+          window.location.assign(target);
+        } else {
+          alert(data.error || 'Upload failed');
+          setUploading(false);
+        }
+      } catch (error) {
+        alert(error.message || 'Network error');
+        setUploading(false);
+      }
+    };
+
+    return (
+      <>
+        <main className="page">
+          <div className="section-header">
+            <div>
+              <div className="eyebrow">Workflow</div>
+              <h1 className="page-title">Upload Invoice</h1>
+              <p className="subtle-copy mt-2">Upload single or multi-invoice documents (PDF, JPG, PNG, WEBP, AVIF). Review the detected invoices and click an invoice to start its extraction.</p>
+            </div>
+            <a href="/documents" className="primary-btn">View All Documents</a>
+          </div>
+
+          <div className="card upload-panel">
+            <div
+              className="dropzone"
+              onClick={() => document.getElementById('fileInput').click()}
+              onDragOver={(e) => {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = 'copy';
+              }}
+              onDragEnter={(e) => e.preventDefault()}
+              onDrop={(e) => {
+                e.preventDefault();
+                handleFiles(e.dataTransfer.files);
+              }}
+            >
+              <input
+                id="fileInput"
+                type="file"
+                multiple
+                accept=".pdf,.doc,.docx,.jpg,.jpeg,.png,.webp,.avif"
+                style={{ display: 'none' }}
+                onChange={(e) => setSelectedFiles(Array.from(e.target.files || []))}
+              />
+              <div className="dropzone-icon">📤</div>
+              <div className="dropzone-title">Click to upload or drag & drop document</div>
+              <div className="dropzone-subtext">Supports PDF, DOC, DOCX, JPG, JPEG, PNG, WEBP, AVIF up to 25 MB</div>
+              {selectedFiles.length > 0 && <div className="file-chip">Selected: {selectedFiles.length} file(s)</div>}
+            </div>
+
+            <button className="primary-btn w-full mt-4" onClick={handleUpload} disabled={uploading}>
+              {uploading ? 'Uploading...' : 'Upload Documents'}
+            </button>
+            {statusText && <div className="progress-box">{statusText}</div>}
+          </div>
+        </main>
+      </>
+    );
+  };
+
+  const QueueView = () => {
+    const [tasks, setTasks] = useState([]);
+    const [loadingTasks, setLoadingTasks] = useState(true);
+
+    useEffect(() => {
+      fetch(`${API}/review-tasks`)
+        .then((res) => res.json())
+        .then((json) => setTasks(json.tasks || []))
+        .catch((err) => console.error(err))
+        .finally(() => setLoadingTasks(false));
+    }, []);
+
+    return (
+      <>
+        <main className="page">
+          <div className="section-header">
+            <div>
+              <div className="eyebrow">Queue</div>
+              <h1 className="page-title">Human-in-the-Loop Review Queue</h1>
+              <p className="subtle-copy mt-2">Review low-confidence extractions and authorize submission.</p>
+            </div>
+          </div>
+
+          <div className="card table-card">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Document</th>
+                  <th>Priority</th>
+                  <th>Reason</th>
+                  <th>Created Date</th>
+                  <th style={{ textAlign: 'right' }}>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {!loadingTasks && tasks.length === 0 && <tr><td colSpan="5"><div className="empty-state">All clear! No pending review tasks.</div></td></tr>}
+                {tasks.map((task) => (
+                  <tr key={task.id}>
+                    <td>{task.document?.fileName || 'Document'}</td>
+                    <td><span className="status-pill warning">Normal</span></td>
+                    <td>{task.reason}</td>
+                    <td>{new Date(task.createdAt).toLocaleDateString()}</td>
+                    <td style={{ textAlign: 'right' }}>
+                      <a href={`/documents/${task.documentId}/review`} className="primary-btn">Open Review</a>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </main>
+      </>
+    );
+  };
+
+  const ReviewView = () => {
+    const docId = path.split('/')[2];
+    const [doc, setDoc] = useState(null);
+    const [savedInvoiceRecords, setSavedInvoiceRecords] = useState([]);
+    const [selectedInvoiceIndex, setSelectedInvoiceIndex] = useState(0);
+    const [loadingDoc, setLoadingDoc] = useState(true);
+    const [processing, setProcessing] = useState(false);
+    const [dispatching, setDispatching] = useState(false);
+    const [selectedSection, setSelectedSection] = useState('header');
+    const [invoiceDrafts, setInvoiceDrafts] = useState({});
+    const [savingInvoice, setSavingInvoice] = useState(false);
+    const [discarding, setDiscarding] = useState(false);
+    const pollingRef = useRef({ cancelled: false, timeout: null, controller: null });
+    const extractionTriggeredRef = useRef(false);
+
+    useEffect(() => {
+      extractionTriggeredRef.current = false;
+    }, [docId]);
+
+    useEffect(() => {
+      let isMounted = true;
+      const loadReview = async () => {
+        try {
+          setDoc(null);
+          setSavedInvoiceRecords([]);
+          setSelectedInvoiceIndex(0);
+          setLoadingDoc(true);
+          const [res, invoicesRes] = await Promise.all([
+            fetchJson(`${API}/documents?refresh=${Date.now()}`),
+            fetchJson(`${API}/documents/${encodeURIComponent(docId)}/invoices?refresh=${Date.now()}`),
+          ]);
+          if (!res.ok) throw new Error('Unable to load document data.');
+          if (!invoicesRes.ok) throw new Error("Unable to check this document's invoices.");
+          const [json, invoicesData] = await Promise.all([res.json(), invoicesRes.json()]);
+          console.log('REVIEW API RESPONSE', { status: res.status, response: json, documentId: docId });
+          const found = (json.documents || []).find((item) => item.id === docId) || null;
+          const invoiceRecords = Array.isArray(invoicesData.invoices) ? invoicesData.invoices : [];
+          if (
+            found
+            && getDocumentReviewPath(
+              { ...found, invoiceCount: Math.max(Number(found.invoiceCount) || 0, Number(invoicesData.invoiceCount) || 0) },
+              invoiceRecords
+            ).endsWith('/multi-workspace')
+          ) {
+            const target = `/documents/${encodeURIComponent(docId)}/multi-workspace`;
+            window.history.replaceState({}, '', target);
+            setPath(target);
+            return;
+          }
+          console.log('EXTRACTED DATA', found?.invoices?.[0]?.extractedData || found?.extraction?.extractedData);
+          console.log('INVOICE HEADER', (found?.invoices?.[0]?.extractedData || found?.extraction?.extractedData)?.invoiceHeader);
+          if (isMounted) {
+            setDoc(found);
+            setSavedInvoiceRecords(invoiceRecords);
+          }
+        } catch (error) {
+          console.error(error);
+        } finally {
+          if (isMounted) setLoadingDoc(false);
+        }
+      };
+      loadReview();
+      return () => { isMounted = false; };
+    }, [docId]);
+
+    useEffect(() => {
+      if (loadingDoc || !doc) {
+        return undefined;
+      }
+
+      const hasRealExtraction = Object.keys(getSingleInvoiceData(doc)).length > 0;
+      if (hasRealExtraction || doc.status === 'FAILED') {
+        setProcessing(false);
+      }
+      return undefined;
+    }, [doc, loadingDoc]);
+
+    const startSingleInvoiceExtraction = async () => {
+      if (!doc) return;
+      if (processing || dispatching || extractionTriggeredRef.current) return;
+
+      const hasRealExtraction = Object.keys(getSingleInvoiceData(doc)).length > 0;
+      if (hasRealExtraction) {
+        setProcessing(false);
+        return;
+      }
+
+      const invoiceRecord = doc.invoices?.[0] || {};
+      const invoiceId = invoiceRecord.id || invoiceRecord.invoiceId || `${docId}-invoice-1`;
+      const pageStart = Number(invoiceRecord.pageStart || 1);
+      const pageEnd = Number(invoiceRecord.pageEnd || doc.pageCount || pageStart);
+      const terminalStatuses = new Set(['FAILED', 'EXTRACTED', 'APPROVED', 'INVOICE_GENERATED', 'IN_REVIEW']);
+
+      pollingRef.current.cancelled = false;
+      setDispatching(true);
+      setProcessing(false);
+      extractionTriggeredRef.current = true;
+
+      try {
+        console.log('[Single Invoice] User-triggered n8n extraction for review:', docId);
+        await triggerInvoiceExtraction({
+          documentId: docId,
+          id: invoiceId,
+          invoiceId: invoiceId,
+          invoiceIndex: invoiceRecord.invoiceIndex ?? 0,
+          pageStart,
+          pageEnd,
+          pages: Array.from({ length: Math.max(1, pageEnd - pageStart + 1) }, (_, i) => pageStart + i),
+        });
+        if (!pollingRef.current.cancelled) setProcessing(true);
+      } catch (error) {
+        console.error('[Single Invoice] Extraction trigger failed:', error);
+        if (!pollingRef.current.cancelled) {
+          setProcessing(false);
+          extractionTriggeredRef.current = false;
+          setDoc((current) => current ? {
+            ...current,
+            status: 'FAILED',
+            errorMessage: error.message || 'n8n did not accept the extraction request.',
+          } : current);
+          setSavedInvoiceRecords((current) => current.map((invoice, index) => (
+            index === 0
+              ? { ...invoice, status: 'FAILED', extractionStatus: 'FAILED', errorMessage: error.message }
+              : invoice
+          )));
+        }
+        return;
+      } finally {
+        if (!pollingRef.current.cancelled) setDispatching(false);
+      }
+
+      const poll = async () => {
+        if (pollingRef.current.cancelled) return;
+        pollingRef.current.controller?.abort();
+        pollingRef.current.controller = new AbortController();
+        try {
+          const requestOptions = { signal: pollingRef.current.controller.signal };
+          const statusRes = await fetchJson(`${API}/documents/${docId}/status?refresh=${Date.now()}`, requestOptions);
+          const status = await statusRes.json();
+          const documentsRes = await fetchJson(`${API}/documents?refresh=${Date.now()}`, requestOptions);
+          const documentsJson = await documentsRes.json();
+          const latestDoc = (documentsJson.documents || []).find((item) => item.id === docId);
+          if (pollingRef.current.cancelled) return;
+
+          if (latestDoc && status.extractedData && Object.keys(status.extractedData).length > 0) {
+            latestDoc.extraction = {
+              ...(latestDoc.extraction || {}),
+              extractedData: status.extractedData,
+              canonicalJson: JSON.stringify(status.extractedData),
+            };
+            if (Array.isArray(latestDoc.invoices) && latestDoc.invoices.length > 0) {
+              latestDoc.invoices[0] = {
+                ...latestDoc.invoices[0],
+                extractedData: status.extractedData,
+                canonicalJson: JSON.stringify(status.extractedData),
+                status: 'EXTRACTED',
+                extractionStatus: 'EXTRACTED',
+              };
+            }
+          }
+          if (latestDoc) {
+            setDoc(latestDoc);
+            if (Array.isArray(latestDoc.invoices)) setSavedInvoiceRecords(latestDoc.invoices);
+          }
+
+          const terminalApiStatus = status?.status || '';
+          const stopPolling = Boolean(
+            status?.isExtracted ||
+            terminalStatuses.has(terminalApiStatus) ||
+            (status.extractedData && Object.keys(status.extractedData).length > 0) ||
+            Object.keys(getSingleInvoiceData(latestDoc)).length > 0
+          );
+          if (stopPolling) {
+            setProcessing(false);
+            return;
+          }
+
+          if (status.status === 'FAILED') {
+            setProcessing(false);
+            extractionTriggeredRef.current = false;
+            setSavedInvoiceRecords((current) => current.map((invoice, index) => (
+              index === 0
+                ? { ...invoice, status: 'FAILED', extractionStatus: 'FAILED', errorMessage: status.errorMessage }
+                : invoice
+            )));
+            return;
+          }
+        } catch (error) {
+          if (error.name !== 'AbortError' && !pollingRef.current.cancelled) console.error(error);
+          setProcessing(false);
+          return;
+        }
+        if (!pollingRef.current.cancelled) {
+          if (pollingRef.current.controller?.signal?.aborted) return;
+          pollingRef.current.timeout = window.setTimeout(poll, 1500);
+        }
+      };
+
+      poll();
+    };
+
+    useEffect(() => () => {
+      pollingRef.current.cancelled = true;
+      if (pollingRef.current.timeout) window.clearTimeout(pollingRef.current.timeout);
+      pollingRef.current.controller?.abort();
+    }, []);
+
+    const reviewInvoices = doc ? (
+      savedInvoiceRecords.length > 0
+        ? savedInvoiceRecords.map((invoice, index) => ({
+          ...invoice,
+          id: invoice.id || invoice.invoiceId || `${doc.id}-invoice-${index + 1}`,
+          invoiceIndex: invoice.invoiceIndex ?? index,
+          documentId: invoice.documentId || doc.id,
+          sourceFileName: invoice.sourceFileName || invoice.fileName || doc.fileName,
+          pageStart: invoice.pageStart || 1,
+          pageEnd: invoice.pageEnd || invoice.pageStart || doc.pageCount || 1,
+          extractedData: parseStoredInvoiceData(invoice),
+        }))
+        : [{
+          ...(doc.invoices?.[0] || {}),
+          id: doc.invoices?.[0]?.id || `${doc.id}-extracted`,
+          invoiceIndex: doc.invoices?.[0]?.invoiceIndex ?? 0,
+          documentId: doc.id,
+          sourceFileName: doc.fileName,
+          fileName: doc.fileName,
+          pageStart: doc.invoices?.[0]?.pageStart || 1,
+          pageEnd: doc.invoices?.[0]?.pageEnd || doc.pageCount || 1,
+          status: doc.invoices?.[0]?.status || doc.status,
+          extractedData: getSingleInvoiceData(doc),
+        }]
+    ) : [];
+
+    useEffect(() => {
+      if (!doc) return;
+      setInvoiceDrafts((current) => {
+        const next = { ...current };
+        reviewInvoices.forEach((invoice) => {
+          const latestData = parseStoredInvoiceData(invoice);
+          const currentData = next[invoice.id];
+          if (!currentData || Object.keys(currentData).length === 0 || Object.keys(latestData || {}).length > 0) {
+            next[invoice.id] = latestData || {};
+          }
+        });
+        return next;
+      });
+    }, [doc, savedInvoiceRecords]);
+
+    if (loadingDoc) return <RouteSkeleton label="Loading review..." />;
+
+    if (!doc) return <main className="page"><div className="card upload-panel">Document not found.</div></main>;
+
+    const invoiceRecord = reviewInvoices[selectedInvoiceIndex] || reviewInvoices[0];
+    const selectedInvoice = {
+      ...(invoiceRecord || {}),
+      id: invoiceRecord?.id || `${doc.id}-extracted`,
+      extractedData: Object.keys(parseStoredInvoiceData(invoiceRecord)).length > 0
+        ? parseStoredInvoiceData(invoiceRecord)
+        : getSingleInvoiceData(doc),
+    };
+    const previewUrl = `${API}/documents/${docId}/file`;
+    const invoicePageStart = Number(selectedInvoice.pageStart || 1);
+    const invoicePageEnd = Number(selectedInvoice.pageEnd || invoicePageStart);
+    const invoicePageUrl = `${API}/documents/${docId}/page-range?start=${invoicePageStart}&end=${invoicePageEnd}`;
+    const isPdfDocument = () => {
+      const mimeType = (doc?.mimeType || '').toLowerCase();
+      const fileName = (doc?.fileName || '').toLowerCase();
+      const storagePath = (doc?.storagePath || '').toLowerCase();
+      return (
+        mimeType.includes('pdf') ||
+        fileName.endsWith('.pdf') ||
+        storagePath.endsWith('.pdf') ||
+        fileName.endsWith('.pdf?') ||
+        fileName.endsWith('.pdf#') ||
+        mimeType.includes('application/pdf')
+      );
+    };
+    const parseInvoiceData = (invoice) => {
+      return parseStoredInvoiceData(invoice);
+    };
+    const selectedInvoiceData = selectedInvoice.extractedData || {};
+    const draft = invoiceDrafts[selectedInvoice?.id];
+    const canonical = draft && Object.keys(draft).length > 0 ? draft : selectedInvoiceData;
+    console.log('REVIEW RENDER MAPPING', { documentId: docId, invoiceId: selectedInvoice.id, extractedData: selectedInvoiceData, invoiceHeader: selectedInvoiceData?.invoiceHeader });
+    const shipmentKey = Array.isArray(canonical.shipmentDetails) ? 'shipmentDetails' : 'shipmentDetail';
+    const shipmentRecords = Array.isArray(canonical[shipmentKey]) ? canonical[shipmentKey] : [];
+    const chargeRecords = [
+      ...shipmentRecords.flatMap((shipment, shipmentIndex) => (
+        Array.isArray(shipment?.chargeLineItems)
+          ? shipment.chargeLineItems.map((charge, chargeIndex) => ({ charge, path: [shipmentKey, shipmentIndex, 'chargeLineItems', chargeIndex], label: `Shipment ${shipmentIndex + 1} Charge ${chargeIndex + 1}` }))
+          : []
+      )),
+      ...(Array.isArray(canonical.chargeLineItems)
+        ? canonical.chargeLineItems.map((charge, chargeIndex) => ({ charge, path: ['chargeLineItems', chargeIndex], label: `Charge ${chargeIndex + 1}` }))
+        : []),
+    ];
+    const knownKeys = ['invoiceHeader', 'shipmentDetails', 'shipmentDetail', 'shipments', 'shipment', 'chargeLineItems', 'chargeLineItem', 'status', 'poorImageQuality', 'error', 'invoiceIndex', 'documentId'];
+    const headerObj = canonical.invoiceHeader && typeof canonical.invoiceHeader === 'object' && !Array.isArray(canonical.invoiceHeader) ? canonical.invoiceHeader : {};
+    const extraTopKeys = Object.keys(canonical || {}).filter(k => !knownKeys.includes(k));
+    const extraTopObj = {};
+    extraTopKeys.forEach(k => {
+      if (typeof canonical[k] !== 'object' || canonical[k] === null) extraTopObj[k] = canonical[k];
+    });
+
+    const sectionDefinitions = [
+      { id: 'header', label: 'Invoice Header' },
+      { id: 'shipment', label: 'Shipment Details' },
+      { id: 'charges', label: 'Charge Line Items' },
+    ];
+    const activeSection = sectionDefinitions.find((section) => section.id === selectedSection) || sectionDefinitions[0];
+    const isEmpty = Object.keys(canonical).length === 0;
+
+    const updateInvoiceField = (key, value) => {
+      setInvoiceDrafts((current) => ({
+        ...current,
+        [selectedInvoice.id]: { ...(current[selectedInvoice.id] || {}), [key]: value }
+      }));
+    };
+
+    const updateInvoicePath = (path, value) => {
+      setInvoiceDrafts((current) => {
+        const next = JSON.parse(JSON.stringify(current[selectedInvoice.id] || {}));
+        let target = next;
+        path.slice(0, -1).forEach((part) => { target = target[part]; });
+        target[path[path.length - 1]] = value;
+        return { ...current, [selectedInvoice.id]: next };
+      });
+    };
+
+    const saveInvoice = async () => {
+      setSavingInvoice(true);
+      try {
+        const response = await fetch(`${API}/documents/${docId}/review`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ invoiceId: selectedInvoice.id, editedData: canonical })
+        });
+        const result = await response.json();
+        if (!response.ok || !result.success) throw new Error(result.error || 'Unable to save invoice.');
+      } catch (error) {
+        alert(error.message || 'Unable to save invoice.');
+      } finally {
+        setSavingInvoice(false);
+      }
+    };
+
+    const discardDocument = async () => {
+      if (discarding) return;
+      setDiscarding(true);
+      pollingRef.current.cancelled = true;
+      if (pollingRef.current.timeout) window.clearTimeout(pollingRef.current.timeout);
+      pollingRef.current.controller?.abort();
+
+      try {
+        const response = await fetch(`${API}/documents/${docId}`, { method: 'DELETE', cache: 'no-store' });
+        const result = await response.json();
+        if (!response.ok || !result.success) throw new Error(result.error || 'Unable to discard document.');
+
+        setDoc(null);
+        setInvoiceDrafts({});
+        setDocuments((current) => current.filter((item) => item.id !== docId));
+        window.history.pushState({}, '', '/documents');
+        setPath('/documents');
+        try {
+          const latestDocuments = await fetchJson(`${API}/documents?refresh=${Date.now()}`);
+          const latestJson = await latestDocuments.json();
+          if (latestDocuments.ok) setDocuments(latestJson.documents || []);
+        } catch (refreshError) {
+          console.error('Document list refresh failed after discard', refreshError);
+        }
+        setDiscarding(false);
+      } catch (error) {
+        if (error.name !== 'AbortError') alert(error.message || 'Unable to discard document.');
+        setDiscarding(false);
+      }
+    };
+
+    const renderEditableNode = (value, path, label, options = {}) => {
+      if (Array.isArray(value)) {
+        return (
+          <div className="section-block" key={path.join('.') || label}>
+            {label && <div className="section-title">{label}</div>}
+            {value.length === 0 && <div className="subtle-copy">No records found</div>}
+            {value.map((item, index) => (
+              <div className="nested-record" key={`${path.join('.')}-${index}`}>
+                <div className="field-label">{label ? `${label} ${index + 1}` : `Record ${index + 1}`}</div>
+                {renderEditableNode(item, [...path, index], '', options)}
+              </div>
+            ))}
+          </div>
+        );
+      }
+      if (value && typeof value === 'object') {
+        return (
+          <div className="field-grid" key={path.join('.') || label}>
+            {Object.entries(value)
+              .filter(([key]) => !options.excludeKeys?.includes(key))
+              .map(([key, child]) => renderEditableNode(child, [...path, key], key, options))}
+          </div>
+        );
+      }
+      return (
+        <div className="field-group" key={path.join('.')}>
+          <label className="field-label">{label || path[path.length - 1]}</label>
+          <input
+            className="field-input"
+            value={value === null || value === undefined ? '' : String(value)}
+            onChange={(event) => updateInvoicePath(path, event.target.value)}
+          />
+        </div>
+      );
+    };
+
+    const renderFieldInputs = () => {
+      if (isEmpty) {
+        return (
+          <div className="section-block">
+            <div className="section-title">Extraction data unavailable</div>
+            <div className="subtle-copy">The API response did not contain extracted invoice data.</div>
+          </div>
+        );
+      }
+      return (
+        <div className="invoice-sections" style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+          {/* 1. INVOICE HEADER */}
+          {activeSection.id === 'header' && (
+            <div className="section-block" style={{ margin: 0 }}>
+              <div className="section-title" style={{ fontSize: '0.72rem', color: 'var(--primary, #6366f1)', marginBottom: '6px' }}>📄 INVOICE HEADER</div>
+              {Object.keys(headerObj).length > 0 ? (
+                renderEditableNode(headerObj, ['invoiceHeader'], '')
+              ) : Object.keys(extraTopObj).length > 0 ? (
+                renderEditableNode(extraTopObj, [], '')
+              ) : (
+                <div className="subtle-copy">No header fields found</div>
+              )}
+            </div>
+          )}
+
+          {/* 2. GENERAL DETAILS */}
+          {activeSection.id === 'header' && Object.keys(headerObj).length > 0 && Object.keys(extraTopObj).length > 0 && (
+            <div className="section-block" style={{ margin: 0 }}>
+              <div className="section-title" style={{ fontSize: '0.72rem', color: 'var(--primary, #6366f1)', marginBottom: '6px' }}>⚙️ GENERAL DETAILS</div>
+              {renderEditableNode(extraTopObj, [], '')}
+            </div>
+          )}
+
+          {/* 3. SHIPMENT DETAILS */}
+          {activeSection.id === 'shipment' && (
+            <div className="section-block" style={{ margin: 0 }}>
+              <div className="section-title" style={{ fontSize: '0.72rem', color: 'var(--primary, #6366f1)', marginBottom: '6px' }}>
+                🚚 SHIPMENT DETAILS {shipmentRecords.length > 0 ? `(${shipmentRecords.length})` : ''}
+              </div>
+              {shipmentRecords.length > 0 ? (
+                renderEditableNode(shipmentRecords, [shipmentKey || 'shipmentDetails'], '', { excludeKeys: ['chargeLineItems', 'chargeLineItem'] })
+              ) : (
+                <div className="subtle-copy">No shipment records found</div>
+              )}
+            </div>
+          )}
+
+          {/* 4. CHARGE LINE ITEMS */}
+          {activeSection.id === 'charges' && (
+            <div className="section-block" style={{ margin: 0 }}>
+              <div className="section-title" style={{ fontSize: '0.72rem', color: 'var(--primary, #6366f1)', marginBottom: '6px' }}>
+                💳 CHARGE LINE ITEMS {chargeRecords.length > 0 ? `(${chargeRecords.length})` : ''}
+              </div>
+              {chargeRecords.length > 0 ? (
+                chargeRecords.map((record) => (
+                  <div className="nested-record" key={record.path.join('.')} style={{ marginBottom: '4px' }}>
+                    <div className="field-label" style={{ color: 'var(--primary, #6366f1)', fontSize: '0.68rem', marginBottom: '2px' }}>{record.label}</div>
+                    {renderEditableNode(record.charge, record.path, '')}
+                  </div>
+                ))
+              ) : (
+                <div className="subtle-copy">No line items found</div>
+              )}
+            </div>
+          )}
+        </div>
+      );
+    };
+
+    return (
+      <>
+        <main className="page">
+          <div className="section-header">
+            <div>
+              <BackButton />
+              <div className="eyebrow">Review</div>
+              <h1 className="page-title">Dynamic Review & Edit</h1>
+              <p className="subtle-copy mt-2">Edit the exact extracted key-value pairs before final generation.</p>
+            </div>
+            <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
+              <button type="button" className="secondary-btn" onClick={discardDocument} disabled={discarding}>
+                {discarding ? 'Discarding...' : 'Discard'}
+              </button>
+              {!isEmpty && <button className="primary-btn" onClick={saveInvoice} disabled={savingInvoice}>{savingInvoice ? 'Saving...' : 'Save & Approve'}</button>}
+              {!isEmpty && <button className="secondary-btn">Generate Invoice</button>}
+            </div>
+          </div>
+
+          <div className="review-page">
+            <div className="card preview-panel">
+              <h3 className="section-title" style={{ color: '#fff', letterSpacing: '0.1em' }}>Original Document</h3>
+              <div className="invoice-preview-list">
+                <div className="invoice-tab-bar">
+                  <button
+                    type="button"
+                    className="invoice-preview-item active"
+                    onClick={startSingleInvoiceExtraction}
+                    disabled={dispatching || processing || Boolean(selectedInvoice.extractionComplete)}
+                    aria-label="Select Invoice 1 and start its extraction"
+                  >
+                    <span><strong>Invoice 1 · Pages {invoicePageStart}-{invoicePageEnd}</strong></span>
+                    <small>
+                      {selectedInvoice.extractionComplete
+                        ? '✓ Extracted'
+                        : dispatching || processing
+                          ? 'Extraction in progress'
+                          : 'Click invoice to start extraction'}
+                    </small>
+                  </button>
+                </div>
+                <div className="preview-box" key={selectedInvoice?.id || docId}>
+                  {isPdfDocument() ? (
+                    <>
+                      <iframe className="document-scroll-viewer" src={`${invoicePageUrl}#page=1`} title="Original invoice pages preview" />
+                      <a className="document-open-fallback" href={`${invoicePageUrl}#page=1`} target="_blank" rel="noreferrer">Open original invoice pages</a>
+                    </>
+                  ) : (
+                    <img src={previewUrl} alt="Document Preview" onError={(e) => { e.currentTarget.src = 'https://placehold.co/600x800/1e293b/475569?text=No+Preview+Available'; }} />
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="card editor-panel">
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
+                <h3 className="section-title" style={{ color: '#fff', letterSpacing: '0.1em', margin: 0 }}>Extracted Fields</h3>
+              </div>
+              <div className="invoice-section-tabs" role="tablist" aria-label="Extracted invoice sections">
+                {sectionDefinitions.map((section) => (
+                  <button key={section.id} type="button" role="tab" aria-selected={activeSection.id === section.id} className={activeSection.id === section.id ? 'primary-btn' : 'secondary-btn'} onClick={() => setSelectedSection(section.id)}>
+                    {section.label}
+                  </button>
+                ))}
+              </div>
+              <div className={`editor-scroll-content ${activeSection.id === 'shipment' ? 'single-invoice-shipment-content' : ''}`}>
+                {dispatching ? (
+                  <div className="emir-extraction-state">
+                    <div className="emir-extraction-spinner" aria-hidden="true" />
+                    <h3 className="emir-extraction-state__title">Contacting n8n</h3>
+                    <p className="emir-extraction-state__desc">Waiting for n8n to confirm it received the extraction request...</p>
+                  </div>
+                ) : processing ? (
+                  <div className="mt-2">
+                    <ExtractionProcessingPanel isSingleInvoice={true} />
+                  </div>
+                ) : isEmpty ? (
+                  <div className="emir-extraction-state">
+                    <h3 className="emir-extraction-state__title">{doc?.status === 'FAILED' ? 'Extraction Failed' : 'Extraction Not Started'}</h3>
+                    <p className="emir-extraction-state__desc">
+                      {doc?.status === 'FAILED'
+                        ? (doc.errorMessage || 'n8n did not accept the extraction request.')
+                        : 'Select “Extract Invoice Data” to send this document to n8n.'}
+                    </p>
+                  </div>
+                ) : (
+                  renderFieldInputs()
+                )}
+              </div>
+            </div>
+          </div>
+        </main>
+        <InvoiceNavigator
+          invoices={reviewInvoices}
+          drafts={reviewInvoices.map((invoice) => invoiceDrafts[invoice.id] || parseStoredInvoiceData(invoice))}
+          selectedInvoiceIndex={selectedInvoiceIndex}
+          primaryDocId={docId}
+          renderCardAction={() => {
+            const hasExtractedData = Object.keys(getSingleInvoiceData(doc)).length > 0;
+            if (hasExtractedData) return null;
+            return (
+              <InvoiceExtractionAction
+                onExtract={startSingleInvoiceExtraction}
+                disabled={processing || dispatching}
+                isPreparing={dispatching}
+                isExtracting={processing}
+                isFailed={doc?.status === 'FAILED'}
+              />
+            );
+          }}
+          onSelectInvoice={(index) => {
+            setSelectedInvoiceIndex(index);
+            const invoice = reviewInvoices[index];
+            if (!invoice) return;
+            const savedData = parseStoredInvoiceData(invoice);
+            if (Object.keys(savedData).length > 0) {
+              setInvoiceDrafts((current) => ({ ...current, [invoice.id]: savedData }));
+            }
+          }}
+        />
+      </>
+    );
+  };
+
+  const MultiInvoiceListView = () => {
+    const docId = path.startsWith('/review-multi/') ? path.split('/')[2] : path.split('/')[2];
+    const [doc, setDoc] = useState(null);
+    const [invoices, setInvoices] = useState([]);
+    const [loadingDoc, setLoadingDoc] = useState(true);
+    const [processing, setProcessing] = useState(false);
+    const [error, setError] = useState('');
+
+    useEffect(() => {
+      let active = true;
+      setDoc(null);
+      setLoadingDoc(true);
+      const load = async () => {
+        try {
+          const [documentResponse, invoiceResponse] = await Promise.all([
+            fetchJson(`${API}/documents?refresh=${Date.now()}`),
+            fetchJson(`${API}/documents/${docId}/invoices?refresh=${Date.now()}`),
+          ]);
+          const documentJson = await documentResponse.json();
+          const invoiceJson = await invoiceResponse.json();
+          if (!documentResponse.ok || !invoiceResponse.ok) throw new Error(invoiceJson.error || documentJson.error || 'Unable to load invoices.');
+          const found = (documentJson.documents || []).find((item) => item.id === docId) || null;
+          if (active) {
+            setDoc(found);
+            setInvoices(Array.isArray(invoiceJson.invoices) ? invoiceJson.invoices : []);
+          }
+        } catch (error) {
+          if (active) setError(error.message || 'Unable to load invoices.');
+        } finally {
+          if (active) setLoadingDoc(false);
+        }
+      };
+      load();
+      return () => { active = false; };
+    }, [docId]);
+
+    useEffect(() => {
+      // Never skip the multi-invoice workspace because of status or empty invoices.
+      // Extraction is triggered from MultiInvoiceWorkspace with the actual document file.
+      setProcessing(false);
+    }, [doc, invoices]);
+
+    if (loadingDoc) return <RouteSkeleton label="Loading invoices..." />;
+    if (!doc) return <main className="page"><div className="card upload-panel">Document not found.</div></main>;
+
+    return <MultiInvoiceWorkspace docId={docId} />;
+  };
+
+  const MultiInvoiceSplitView = ({ doc, invoices, docId }) => {
+    return <MultiInvoiceWorkspace docId={docId} />;
+  };
+  const MultiInvoiceDetailView = () => {
+    const routeParts = path.split('/');
+    const docId = routeParts[2];
+    return <MultiInvoiceWorkspace docId={docId} />;
+  };
+
+  const InvoiceView = () => {
+    const docId = path.split('/')[2];
+    const [doc, setDoc] = useState(null);
+    const [loading, setLoading] = useState(true);
+
+    useEffect(() => {
+      async function load() {
+        try {
+          const res = await fetch(`${API}/documents`);
+          const json = await res.json();
+          setDoc((json.documents || []).find((item) => item.id === docId) || null);
+        } catch (error) {
+          console.error(error);
+        } finally {
+          setLoading(false);
+        }
+      }
+      load();
+    }, [docId]);
+
+    if (loading) return <RouteSkeleton label="Loading invoice..." />;
+    if (!doc) return <main className="page"><div className="card upload-panel">Invoice not found.</div></main>;
+
+    let canonical = {};
+    try {
+      canonical = JSON.parse(doc.extraction?.finalSubmittedData || doc.extraction?.canonicalJson || '{}');
+    } catch (error) {
+      canonical = {};
+    }
+
+    return (
+      <>
+        <main className="page">
+          <div className="card upload-panel">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '1rem' }}>
+              <a href={`/documents/${docId}/review`} className="secondary-btn">← Back to Review</a>
+              <div style={{ display: 'flex', gap: '0.75rem' }}>
+                <button className="secondary-btn">Print</button>
+                <button className="primary-btn">Download PDF</button>
+              </div>
+            </div>
+
+            <div className="mt-4" style={{ background: '#fff', color: '#0F2033', borderRadius: '1rem', padding: '2rem' }}>
+              <h1 style={{ margin: '0 0 1rem', fontSize: '2rem' }}>Processed Document</h1>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '0.75rem' }}>
+                {Object.entries(canonical).map(([key, value]) => (
+                  <div key={key} style={{ borderBottom: '1px solid #dfe7f0', paddingBottom: '0.5rem' }}>
+                    <div style={{ fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.12em', color: '#6b7280', marginBottom: '0.35rem' }}>{key}</div>
+                    <div style={{ fontWeight: 700, wordBreak: 'break-word' }}>{typeof value === 'object' ? JSON.stringify(value) : String(value ?? '')}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </main>
+      </>
+    );
+  };
+
+  const renderInvoicesView = () => {
+    const invoices = documents.filter((doc) => {
+      const needsReview = String(doc.status || '').toUpperCase() === 'NEEDS_REVIEW'
+        || (doc.invoices || []).some((invoice) => getInvoicePoorImageState(invoice).needsReview);
+      return (doc.status === 'INVOICE_GENERATED' || doc.extraction?.finalSubmittedData) && !needsReview;
+    });
+
+    return (
+      <>
+        <main className="page">
+          <div className="section-header">
+            <div>
+              <div className="eyebrow">Invoices</div>
+              <h1 className="page-title">Generated Invoices Dashboard</h1>
+              <p className="subtle-copy mt-2">Browse, print, and download generated billing invoices.</p>
+            </div>
+            <a href="/documents/upload" className="primary-btn">+ Invoice Intake</a>
+          </div>
+
+          <div className="card table-card">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Invoice #</th>
+                  <th>Shipper</th>
+                  <th>Consignee</th>
+                  <th>Total Amount</th>
+                  <th>Status</th>
+                  <th style={{ textAlign: 'right' }}>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {invoices.length === 0 ? <tr><td colSpan="6"><div className="empty-state">No generated invoices found yet. Upload and generate one!</div></td></tr> : invoices.map((inv) => {
+                  let payload = {};
+                  try {
+                    payload = JSON.parse(inv.extraction?.finalSubmittedData || inv.extraction?.canonicalJson || '{}');
+                  } catch (error) {
+                    payload = {};
+                  }
+                  const amount = Number(payload.totalAmount || 0).toFixed(2);
+                  return (
+                    <tr key={inv.id}>
+                      <td>{payload.documentNumber || 'INV-001'}</td>
+                      <td>{payload.shipperName || 'Apex Freight'}</td>
+                      <td>{payload.consigneeName || 'Global Distribution'}</td>
+                      <td style={{ color: '#7ae7ac', fontWeight: 700 }}>$ {amount} USD</td>
+                      <td><span className="status-pill success">{inv.status || 'INVOICE_GENERATED'}</span></td>
+                      <td style={{ textAlign: 'right' }}><a href={`/invoices/${inv.id}`} className="nav-link">View Invoice</a></td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </main>
+      </>
+    );
+  };
+
+  /**
+   * FlaggedInvoicesView – displays individually poor-quality extracted invoices.
+   */
+  const FlaggedInvoicesView = ({ documents: docs = [] }) => {
+    const [escalationTarget, setEscalationTarget] = useState(null);
+    const [resolvedKeys, setResolvedKeys] = useState(() => {
+      try { return new Set(JSON.parse(localStorage.getItem('resolved_escalations') || '[]')); }
+      catch { return new Set(); }
+    });
+    const [toastMsg, setToastMsg] = useState('');
+
+    // Collect invoice-level visual or extraction issues; a document-level flag must not fan out.
+    const flaggedItems = [];
+    docs.forEach((doc) => {
+      (doc.invoices || []).forEach((inv, idx) => {
+        const invoiceIndex = Number(inv.invoiceIndex ?? idx);
+        const qualityState = getInvoicePoorImageState(inv);
+        const { needsReview } = qualityState;
+        const itemKey = `${doc.id}-${invoiceIndex}`;
+        if (!Number.isInteger(invoiceIndex) || invoiceIndex < 0) return;
+        if (needsReview && !resolvedKeys.has(itemKey) && !resolvedKeys.has(doc.id)) {
+          flaggedItems.push({
+            key: itemKey,
+            docId: doc.id,
+            invoiceId: inv.id || String(invoiceIndex),
+            docName: doc.fileName,
+            invoiceLabel: inv.invoiceNumber ? `Invoice ${inv.invoiceNumber}` : `Invoice #${invoiceIndex + 1}`,
+            status: qualityState.qualityReasons.map(getInvoiceQualityReasonLabel).join(' / '),
+            reasonLabel: qualityState.qualityReasons.map(getInvoiceQualityReasonLabel).join(' / '),
+            date: doc.createdAt ? new Date(doc.createdAt).toLocaleDateString() : '—',
+            reviewUrl: `/documents/${doc.id}/multi-workspace?invoiceIndex=${invoiceIndex}`,
+          });
+        }
+      });
+    });
+
+    const handleEscalationSuccess = (item) => {
+      setEscalationTarget(null);
+      setToastMsg(`✓ Escalation submitted for "${item.invoiceLabel}" in ${item.docName}`);
+      setTimeout(() => setToastMsg(''), 4000);
+    };
+
+    const handleResolve = (item) => {
+      const next = new Set(resolvedKeys);
+      next.add(item.key);
+      setResolvedKeys(next);
+      try { localStorage.setItem('resolved_escalations', JSON.stringify([...next])); } catch {}
+      setToastMsg(`✓ "${item.invoiceLabel}" marked as resolved`);
+      setTimeout(() => setToastMsg(''), 3000);
+    };
+
+    return (
+      <main className="page">
+        <div className="section-header">
+          <div>
+            <div className="eyebrow">Quality Review</div>
+            <h1 className="page-title">Flagged Invoices</h1>
+            <p className="subtle-copy mt-2">Review low visual quality, missing invoice numbers, and incomplete extraction data.</p>
+          </div>
+          <span className="flagged-view-badge">
+            📸 {flaggedItems.length} Flagged Invoice{flaggedItems.length !== 1 ? 's' : ''}
+          </span>
+        </div>
+
+        {toastMsg && (
+          <div style={{
+            marginBottom: '1rem',
+            padding: '0.8rem 1.2rem',
+            background: 'rgba(31, 201, 145, 0.15)',
+            border: '1px solid var(--success)',
+            borderRadius: '8px',
+            color: '#7ae7ac',
+            fontWeight: 600,
+            fontSize: '0.9rem'
+          }}>
+            {toastMsg}
+          </div>
+        )}
+
+        <div className="card table-card">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Document</th>
+                <th>Invoice</th>
+                <th>Status</th>
+                <th>Date</th>
+                <th style={{ textAlign: 'right' }}>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {flaggedItems.length === 0 ? (
+                <tr>
+                  <td colSpan="5">
+                    <div className="empty-state">
+                      🎉 No invoices currently need review.
+                    </div>
+                  </td>
+                </tr>
+              ) : flaggedItems.map((item) => (
+                <tr key={item.key}>
+                  <td>
+                    <div style={{ fontWeight: 600, color: '#f8fafc' }}>{item.docName}</div>
+                  </td>
+                  <td>
+                    <span className="status-pill neutral">{item.invoiceLabel}</span>
+                  </td>
+                  <td>
+                    <span className="status-pill warning-strong">
+                      {item.reasonLabel}
+                    </span>
+                  </td>
+                  <td style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>{item.date}</td>
+                  <td style={{ textAlign: 'right' }}>
+                    <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' }}>
+                      <a
+                        href={item.reviewUrl}
+                        className="primary-btn"
+                        style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem' }}
+                      >
+                        Review
+                      </a>
+                      <button
+                        type="button"
+                        id={`escalate-flag-btn-${item.key}`}
+                        className="escalate-btn"
+                        onClick={() => setEscalationTarget(item)}
+                      >
+                        🚨 Escalate
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary-btn"
+                        onClick={() => handleResolve(item)}
+                        style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem', color: '#7ae7ac', borderColor: 'rgba(31,201,145,0.4)' }}
+                      >
+                        ✓ Resolve
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        {escalationTarget && (
+          <EscalationModal
+            docId={escalationTarget.docId}
+            invoiceId={escalationTarget.invoiceId}
+            invoiceLabel={escalationTarget.invoiceLabel}
+            reasonLabel={escalationTarget.reasonLabel}
+            onClose={() => setEscalationTarget(null)}
+            onSuccess={() => handleEscalationSuccess(escalationTarget)}
+          />
+        )}
+      </main>
+    );
+  };
+
+  if (loading && route !== 'documents' && route !== 'escalations') {
+    return <><>{nav}</><RouteSkeleton label="Loading dashboard..." /></>;
+  }
+
+
+  let renderedRoute;
+  switch (route) {
+    case 'escalations': renderedRoute = <Escalations />; break;
+    case 'flagged': renderedRoute = <FlaggedInvoicesView documents={documents} />; break;
+    case 'preview': renderedRoute = <PreviewRange />; break;
+    case 'upload': renderedRoute = <UploadMultiView />; break;
+    case 'upload-multi': renderedRoute = <UploadMultiView />; break;
+    case 'multi-workspace': renderedRoute = <MultiInvoiceWorkspace docId={path.split('/')[2]} />; break;
+    case 'batch-workspace': renderedRoute = <MultiInvoiceWorkspace />; break;
+    case 'review': renderedRoute = <MultiInvoiceWorkspace docId={path.split('/')[2]} singleInvoiceMode />; break;
+    case 'review-multi': renderedRoute = <MultiInvoiceListView />; break;
+    case 'multi-invoice-list': renderedRoute = <MultiInvoiceListView />; break;
+    case 'multi-invoice-detail': renderedRoute = <MultiInvoiceDetailView />; break;
+    case 'invoice': renderedRoute = <InvoiceView />; break;
+    case 'invoices': renderedRoute = renderInvoicesView(); break;
+    case 'queue': renderedRoute = <QueueView />; break;
+    default: renderedRoute = renderDocumentsView();
+  }
+  return <><>{nav}{loadError && <div className="app-load-error" role="alert">{loadError}</div>}</><Suspense fallback={<RouteSkeleton />}><RouteErrorBoundary>{renderedRoute}</RouteErrorBoundary></Suspense></>;
+}
+
+export default App;

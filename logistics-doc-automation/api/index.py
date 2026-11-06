@@ -1,0 +1,3368 @@
+
+from fastapi import FastAPI, Request, UploadFile, File
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+import asyncio
+import sqlite3
+import json
+import uuid
+import time
+import os
+import base64
+import hashlib
+import mimetypes
+import urllib.request
+import urllib.error
+import threading
+from datetime import datetime
+import re
+import sys
+from urllib.parse import urlparse
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+try:
+    import psycopg2
+except:
+    psycopg2 = None
+
+from scripts.invoice_routing import detect_invoice_groups
+from scripts.image_quality import get_image_blur_quality, get_pdf_page_range_quality
+from scripts.evidence_locations import compute_pdf_locations
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+import traceback
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={"error": str(exc), "trace": traceback.format_exc()}
+    )
+
+SAVE_APPROVED_WEBHOOK_URL = "https://n8n.provelopers.net/webhook/e7761187-ad68-4fa4-a8e8-87f6eee47314"
+SINGLE_INVOICE_WEBHOOK_URL = "https://n8n.provelopers.net/webhook/726784a2-239a-4a6d-a837-85828f4b2ca2"
+MULTI_INVOICE_WEBHOOK_URL = "https://n8n.provelopers.net/webhook/cfc18821-b562-4b0f-8d34-457f83e03f2e"
+
+def load_environment():
+    """Load environment variables from .env and .env.local into os.environ"""
+    for env_name in [".env", ".env.local"]:
+        env_file = os.path.join(BASE_DIR, env_name)
+        if os.path.exists(env_file):
+            with open(env_file, "r", encoding="utf-8") as ef:
+                for line in ef:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip('"').strip("'")
+                        if k:
+                            os.environ[k] = v
+
+load_environment()
+
+def extract_invoice_pages(pdf_source, start_page, end_page):
+    """
+    Extract ONLY specific pages from PDF (1-indexed start_page and end_page)
+    """
+    try:
+        try:
+            from pypdf import PdfReader, PdfWriter
+        except ImportError:
+            from PyPDF2 import PdfReader, PdfWriter
+        from io import BytesIO
+
+        if isinstance(pdf_source, (bytes, bytearray)):
+            pdf_reader = PdfReader(BytesIO(pdf_source))
+        elif isinstance(pdf_source, BytesIO):
+            pdf_reader = PdfReader(pdf_source)
+        else:
+            pdf_reader = PdfReader(pdf_source)
+
+        total_pages = len(pdf_reader.pages)
+        start_page = int(start_page)
+        end_page = int(end_page)
+
+        if start_page < 1 or end_page > total_pages or start_page > end_page:
+            return {
+                "success": False,
+                "error": f"Invalid page range: [{start_page}, {end_page}]. Total pages: {total_pages}"
+            }
+
+        pdf_writer = PdfWriter()
+        for page_num in range(start_page - 1, end_page):
+            pdf_writer.add_page(pdf_reader.pages[page_num])
+
+        output = BytesIO()
+        pdf_writer.write(output)
+        output.seek(0)
+        pdf_bytes = output.getvalue()
+        base64_encoded = base64.b64encode(pdf_bytes).decode('utf-8')
+
+        return {
+            "success": True,
+            "base64": base64_encoded,
+            "pages_extracted": end_page - start_page + 1,
+            "file_size": len(pdf_bytes)
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+def extract_text_from_pdf_pages(pdf_source, start_page, end_page):
+    """
+    Extract plain text from specific pages of a PDF (1-indexed).
+    Returns the concatenated text string, or empty string on failure.
+    """
+    try:
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            from PyPDF2 import PdfReader
+        from io import BytesIO
+
+        if isinstance(pdf_source, (bytes, bytearray)):
+            pdf_reader = PdfReader(BytesIO(pdf_source))
+        elif isinstance(pdf_source, BytesIO):
+            pdf_reader = PdfReader(pdf_source)
+        else:
+            pdf_reader = PdfReader(pdf_source)
+
+        start_page = max(1, int(start_page))
+        end_page = min(len(pdf_reader.pages), int(end_page))
+        texts = []
+        for page_num in range(start_page - 1, end_page):
+            try:
+                text = pdf_reader.pages[page_num].extract_text() or ""
+                texts.append(text)
+            except Exception:
+                pass
+        return "\n".join(texts).strip()
+    except Exception:
+        return ""
+
+def _build_multipart_body(fields, files):
+    """Build multipart/form-data body. files: list of (field_name, filename, content_type, bytes)."""
+    boundary = f"----InvoiceBoundary{uuid.uuid4().hex}"
+    chunks = []
+    for key, value in fields.items():
+        if value is None:
+            continue
+        chunks.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{value}\r\n".encode("utf-8")
+        )
+    for field_name, filename, content_type, file_bytes in files:
+        header = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{field_name}"; filename="{filename}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n"
+        ).encode("utf-8")
+        chunks.append(header + file_bytes + b"\r\n")
+    chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+    return b"".join(chunks), boundary
+
+
+def _document_invoice_count(doc_id):
+    """Return how many invoice rows exist for a document (defaults to 1)."""
+    if not doc_id:
+        return 1
+    conn = None
+    try:
+        conn = get_db()
+        cursor = execute_query(conn, "SELECT COUNT(*) FROM DocumentInvoice WHERE documentId = ?", (doc_id,))
+        row = cursor.fetchone()
+        count = int(row[0] or 0) if row else 0
+        return count if count > 0 else 1
+    except Exception as exc:
+        print(f"[n8n] Warning: could not resolve invoice count for documentId={doc_id}: {exc}")
+        return 1
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _resolve_extraction_webhook(doc_id):
+    """Pick Single vs Multiple Invoice n8n webhook from document invoice count."""
+    invoice_count = _document_invoice_count(doc_id)
+    if invoice_count >= 2:
+        webhook_url = (
+            os.getenv('MULTI_INVOICE_N8N_WEBHOOK_URL')
+            or os.getenv('N8N_WEBHOOK_URL')
+            or MULTI_INVOICE_WEBHOOK_URL
+        )
+        return webhook_url, 'multi-invoice', invoice_count
+    webhook_url = (
+        os.getenv('SINGLE_INVOICE_N8N_WEBHOOK_URL')
+        or os.getenv('N8N_WEBHOOK_URL')
+        or SINGLE_INVOICE_WEBHOOK_URL
+    )
+    return webhook_url, 'single-invoice', invoice_count
+
+
+def _validate_production_webhook_url(webhook_url):
+    parsed_url = urlparse(webhook_url or "")
+    if (
+        parsed_url.scheme != "https"
+        or not parsed_url.netloc
+        or "/webhook/" not in parsed_url.path
+        or "/webhook-test/" in parsed_url.path
+    ):
+        raise ValueError(
+            "n8n webhook URL must be an absolute HTTPS production URL containing /webhook/ "
+            "and must not contain /webhook-test/"
+        )
+    return webhook_url
+
+
+def send_to_n8n_webhook(invoice_index, pages, base64_pdf, doc_id=None, raw_ocr_text=None, file_bytes=None, page_start_for_ocr=None, page_end_for_ocr=None, image_quality=None, invoice_id=None, source_file_name=None, source_mime_type=None, source_file_size=None, dispatch_file_size=None):
+    """
+    Send isolated invoice payload to n8n webhook.
+    The attached PDF/file contains ONLY this invoice's pages — never the full multi-invoice document.
+    Routes to the Single Invoice workflow for 1-invoice docs, otherwise Multiple Invoice.
+    """
+    webhook_url, workflow_type, invoice_count = _resolve_extraction_webhook(doc_id)
+    if not webhook_url:
+        return {
+            "success": False,
+            "error": "n8n webhook URL not set in environment"
+        }
+    try:
+        webhook_url = _validate_production_webhook_url(webhook_url)
+    except ValueError as exc:
+        print(f"[n8n DISPATCH] URL={webhook_url!r} status=0 responseBody='' thrownError={exc}")
+        return {"success": False, "status": 0, "error": str(exc)}
+
+    page_start = pages[0] if isinstance(pages, (list, tuple)) and len(pages) > 0 else 1
+    page_end = pages[-1] if isinstance(pages, (list, tuple)) and len(pages) > 1 else page_start
+    page_list = list(range(int(page_start), int(page_end) + 1))
+    resolved_invoice_id = invoice_id or f"{doc_id}-invoice-{int(invoice_index) + 1}"
+
+    # Extract text from the isolated PDF pages for n8n LLM processing
+    if raw_ocr_text is None:
+        if file_bytes:
+            raw_ocr_text = extract_text_from_pdf_pages(
+                file_bytes,
+                page_start_for_ocr if page_start_for_ocr is not None else page_start,
+                page_end_for_ocr if page_end_for_ocr is not None else page_end
+            )
+        else:
+            try:
+                import base64 as _b64
+                raw_ocr_text = extract_text_from_pdf_pages(
+                    _b64.b64decode(base64_pdf),
+                    1,
+                    page_end - page_start + 1
+                )
+            except Exception:
+                raw_ocr_text = ""
+
+    # Build callback URL so n8n can POST extracted data back to us.
+    # Respect an explicit APP_BASE_URL. Only fall back to the production default
+    # when the app itself is running in a Vercel environment.
+    app_base_url = os.getenv('APP_BASE_URL')
+    if app_base_url and app_base_url.strip():
+        app_base_url = app_base_url.strip().rstrip('/')
+    elif os.getenv('VERCEL') or os.getenv('VERCEL_ENV') or os.getenv('VERCEL_URL'):
+        app_base_url = 'https://logistics-doc-automation.vercel.app'
+    else:
+        app_base_url = 'http://localhost:3000'
+    callback_url = f"{app_base_url}/api/documents/{doc_id}/extraction/callback"
+
+    safe_source_name = os.path.basename((source_file_name or "").replace("\\", "/")).replace('"', "_").replace("\r", "_").replace("\n", "_")
+    is_pdf = safe_source_name.lower().endswith(".pdf") or (
+        not os.path.splitext(safe_source_name)[1] and (source_mime_type or "").lower() == "application/pdf"
+    )
+    file_name = f"{resolved_invoice_id}.pdf" if is_pdf else (safe_source_name or resolved_invoice_id)
+    stored_mime_type = (source_mime_type or "").split(";", 1)[0].strip()
+    file_type = "application/pdf" if is_pdf else (
+        stored_mime_type if stored_mime_type and stored_mime_type != "application/octet-stream"
+        else mimetypes.guess_type(file_name)[0] or stored_mime_type or "application/octet-stream"
+    )
+
+    try:
+        file_payload_bytes = base64.b64decode(base64_pdf, validate=True) if base64_pdf else b""
+    except (ValueError, TypeError) as exc:
+        error_message = f"Invalid base64 file payload for invoice {resolved_invoice_id}: {exc}"
+        print(f"[n8n FILE] invoiceId={resolved_invoice_id} fileName={file_name!r} mimeType={file_type!r} validationError={error_message}")
+        return {"success": False, "status": 0, "error": error_message}
+    if not file_payload_bytes:
+        error_message = f"Empty file payload for invoice {resolved_invoice_id}"
+        print(f"[n8n FILE] invoiceId={resolved_invoice_id} fileName={file_name!r} mimeType={file_type!r} validationError={error_message}")
+        return {"success": False, "status": 0, "error": error_message}
+    if base64.b64encode(file_payload_bytes).decode("ascii") != base64_pdf:
+        error_message = f"File payload failed base64 integrity validation for invoice {resolved_invoice_id}"
+        print(f"[n8n FILE] invoiceId={resolved_invoice_id} fileName={file_name!r} mimeType={file_type!r} validationError={error_message}")
+        return {"success": False, "status": 0, "error": error_message}
+    file_size = len(file_payload_bytes)
+    if dispatch_file_size is not None and file_size != dispatch_file_size:
+        error_message = f"File payload size mismatch for invoice {resolved_invoice_id}: expected {dispatch_file_size}, decoded {file_size}"
+        print(f"[n8n FILE] invoiceId={resolved_invoice_id} fileName={file_name!r} mimeType={file_type!r} validationError={error_message}")
+        return {"success": False, "status": 0, "error": error_message}
+    if not is_pdf and file_bytes is not None and file_payload_bytes != file_bytes:
+        error_message = f"Uploaded file bytes do not match the stored source for invoice {resolved_invoice_id}"
+        print(f"[n8n FILE] invoiceId={resolved_invoice_id} fileName={file_name!r} mimeType={file_type!r} validationError={error_message}")
+        return {"success": False, "status": 0, "error": error_message}
+
+    payload = {
+        "invoiceIndex": invoice_index,
+        "invoiceId": resolved_invoice_id,
+        "pages": page_list,
+        "pageStart": page_start,
+        "pageEnd": page_end,
+        "fileBase64": base64_pdf,
+        "fileName": file_name,
+        "mimeType": file_type,
+        "documentId": doc_id,
+        "docId": doc_id,
+        "rawOcrText": raw_ocr_text,
+        "callbackUrl": callback_url,
+        "imageQuality": image_quality,
+        "workflowType": workflow_type,
+        "detectedInvoiceCount": invoice_count,
+        "timestamp": datetime.now().isoformat()
+    }
+
+    print(
+        f"[n8n FILE] invoiceId={resolved_invoice_id} fileName={file_name!r} "
+        f"sizeBytes={file_size} sourceSizeBytes={source_file_size} mimeType={file_type!r} "
+        f"sha256={hashlib.sha256(file_payload_bytes).hexdigest()}"
+    )
+    print(
+        f"[n8n DISPATCH] Initiating dispatch -> invoiceId={resolved_invoice_id} documentId={doc_id} "
+        f"workflowType={workflow_type} invoiceCount={invoice_count} "
+        f"pageStart={page_start} pageEnd={page_end} pages={page_list} webhook={webhook_url}"
+    )
+
+    try:
+        if file_payload_bytes:
+            fields = {
+                "documentId": str(doc_id or ""),
+                "docId": str(doc_id or ""),
+                "invoiceId": str(resolved_invoice_id),
+                "invoiceIndex": str(invoice_index),
+                "pageStart": str(page_start),
+                "pageEnd": str(page_end),
+                "pages": json.dumps(page_list),
+                "fileName": file_name,
+                "mimeType": file_type,
+                "fileSize": str(file_size),
+                "callbackUrl": callback_url,
+                "rawOcrText": raw_ocr_text or "",
+                "imageQuality": str(image_quality),
+                "workflowType": workflow_type,
+                "detectedInvoiceCount": str(invoice_count),
+                "fileBase64": base64_pdf,
+            }
+            body, boundary = _build_multipart_body(
+                fields,
+                [
+                    ("data", file_name, file_type, file_payload_bytes),
+                ],
+            )
+            req = urllib.request.Request(
+                webhook_url,
+                data=body,
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                method="POST",
+            )
+        else:
+            req = urllib.request.Request(
+                webhook_url,
+                data=json.dumps(payload).encode('utf-8'),
+                headers={'Content-Type': 'application/json'},
+                method='POST'
+            )
+        with urllib.request.urlopen(req, timeout=90) as response:
+            resp_body = response.read().decode('utf-8', errors='replace')
+            n8n_status = response.status
+            print(
+                f"[n8n RESPONSE] URL={webhook_url} status={n8n_status} "
+                f"responseBody={resp_body[:2000]!r}"
+            )
+            if not 200 <= n8n_status < 300:
+                print(
+                    f"[n8n] ❌ invoiceId={resolved_invoice_id} documentId={doc_id} "
+                    f"pageStart={page_start} pageEnd={page_end} n8nStatus={n8n_status} error={resp_body[:500]}"
+                )
+                return {
+                    "success": False,
+                    "status": n8n_status,
+                    "error": f"n8n webhook returned HTTP {n8n_status}: {resp_body[:300]}",
+                    "response": resp_body
+                }
+            try:
+                extracted_data = json.loads(resp_body)
+            except Exception:
+                extracted_data = {"rawResponse": resp_body}
+
+            print(f"[n8n] ✅ Isolated invoice {resolved_invoice_id} accepted (status={n8n_status})")
+            return {
+                "success": True,
+                "status": n8n_status,
+                "extractedData": extracted_data
+            }
+    except urllib.error.HTTPError as e:
+        resp_body = ""
+        try:
+            resp_body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            resp_body = str(e)
+        print(
+            f"[n8n RESPONSE] URL={webhook_url} status={e.code} "
+            f"responseBody={resp_body[:2000]!r} thrownError={e}"
+        )
+        return {
+            "success": False,
+            "status": e.code,
+            "error": f"n8n webhook returned HTTP {e.code}: {resp_body[:300]}",
+            "response": resp_body
+        }
+    except Exception as e:
+        print(
+            f"[n8n RESPONSE] URL={webhook_url} status=0 responseBody='' thrownError={e}"
+        )
+        return {
+            "success": False,
+            "status": 0,
+            "error": f"Cannot connect to n8n webhook: {e}"
+        }
+
+# On Vercel, filesystem is read-only except /tmp
+if os.getenv("VERCEL"):
+    DB_PATH = "/tmp/dev.db"
+else:
+    DB_PATH = os.path.join(BASE_DIR, "prisma", "dev.db")
+POSTGRES_URL = os.getenv("POSTGRES_URL")
+if not POSTGRES_URL:
+    _db_url = os.getenv("DATABASE_URL", "")
+    if _db_url.startswith("postgres"):
+        POSTGRES_URL = _db_url
+
+DB_INITIALIZED = False
+
+def require_durable_database():
+    if os.getenv("VERCEL") and not POSTGRES_URL:
+        raise RuntimeError(
+            "Durable database is not configured. Set POSTGRES_URL or DATABASE_URL "
+            "to a PostgreSQL connection before using document processing on Vercel."
+        )
+
+def init_db(conn):
+    global DB_INITIALIZED
+    if DB_INITIALIZED: return
+    queries = [
+        "CREATE TABLE IF NOT EXISTS Customer (id VARCHAR(50) PRIMARY KEY, name VARCHAR(255), code VARCHAR(50), logoUrl VARCHAR(255), primaryColor VARCHAR(50), secondaryColor VARCHAR(50));",
+        "CREATE TABLE IF NOT EXISTS Document (id VARCHAR(50) PRIMARY KEY, fileName VARCHAR(255), fileSize INTEGER, mimeType VARCHAR(100), storagePath VARCHAR(255), documentType VARCHAR(50), status VARCHAR(50), overallConfidence REAL, invoiceGeneratedAt TIMESTAMP, createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP, errorMessage TEXT);",
+        "CREATE TABLE IF NOT EXISTS Extraction (documentId VARCHAR(50) PRIMARY KEY, canonicalJson TEXT, confidenceScores TEXT, finalSubmittedData TEXT);",
+        "CREATE TABLE IF NOT EXISTS DocumentInvoice (id VARCHAR(100) PRIMARY KEY, documentId VARCHAR(50) NOT NULL, invoiceIndex INTEGER NOT NULL, pageStart INTEGER, pageEnd INTEGER, rawOcrText TEXT, canonicalJson TEXT, confidenceScores TEXT, finalSubmittedData TEXT, status VARCHAR(50) DEFAULT 'EXTRACTED', overallConfidence REAL, createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP, errorMessage TEXT);",
+        "CREATE TABLE IF NOT EXISTS ReviewTask (id VARCHAR(50) PRIMARY KEY, documentId VARCHAR(50), status VARCHAR(50), reason TEXT, createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP, resolvedAt TIMESTAMP);",
+        "CREATE TABLE IF NOT EXISTS AuditLog (id VARCHAR(50) PRIMARY KEY, documentId VARCHAR(50), action VARCHAR(50), description TEXT, createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP);"
+    ]
+    cursor = conn.cursor()
+    for q in queries:
+        cursor.execute(q)
+    conn.commit()
+    
+    # Safely add columns that might already exist
+    alter_statements = [
+        "ALTER TABLE Document ADD COLUMN customerId TEXT DEFAULT 'cust-1';",
+        "ALTER TABLE Document ADD COLUMN updatedAt TIMESTAMP;",
+        "ALTER TABLE Document ADD COLUMN fileData TEXT;",
+        "ALTER TABLE Document ADD COLUMN pageCount INTEGER DEFAULT 1;",
+        "ALTER TABLE Document ADD COLUMN processedPages INTEGER DEFAULT 0;",
+        "ALTER TABLE Document ADD COLUMN imageQuality REAL;",
+        "ALTER TABLE Document ADD COLUMN errorMessage TEXT;",
+        "ALTER TABLE DocumentInvoice ADD COLUMN rawOcrText TEXT;",
+        "ALTER TABLE DocumentInvoice ADD COLUMN imageQuality REAL;",
+        "ALTER TABLE DocumentInvoice ADD COLUMN status TEXT;",
+        "ALTER TABLE DocumentInvoice ADD COLUMN errorMessage TEXT;",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_document_invoice_order ON DocumentInvoice(documentId, invoiceIndex);",
+        "CREATE INDEX IF NOT EXISTS idx_document_invoice_status_quality ON DocumentInvoice(status, imageQuality);",
+    ]
+    for stmt in alter_statements:
+        try:
+            cursor.execute(stmt)
+            conn.commit()
+        except Exception:
+            conn.rollback()  # Reset transaction so subsequent queries work
+    DB_INITIALIZED = True
+
+def count_pdf_pages(file_bytes):
+    """Count PDF page objects without trusting file size or client metadata."""
+    try:
+        return max(1, len(re.findall(rb"/Type\s*/Page\b", file_bytes)))
+    except Exception:
+        return 1
+    
+
+def get_db():
+    if POSTGRES_URL and psycopg2:
+        conn = psycopg2.connect(POSTGRES_URL)
+    else:
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        conn = sqlite3.connect(DB_PATH)
+    
+    if not DB_INITIALIZED:
+        init_db(conn)
+    return conn
+
+def execute_query(conn, query, params=()):
+    cursor = conn.cursor()
+    if POSTGRES_URL and psycopg2:
+        query = query.replace("?", "%s")
+        if "INSERT OR REPLACE INTO" in query:
+            query = query.replace("INSERT OR REPLACE INTO", "INSERT INTO")
+    cursor.execute(query, params)
+    return cursor
+
+@app.get("/api/debug-info")
+def debug_info():
+    db_error = None
+    db_ok = False
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        db_ok = True
+        conn.close()
+    except Exception as e:
+        db_error = str(e)
+    return {
+        "status": "app_loaded",
+        "DB_PATH": DB_PATH,
+        "POSTGRES_URL_set": bool(POSTGRES_URL),
+        "psycopg2_available": psycopg2 is not None,
+        "VERCEL": os.getenv("VERCEL", "not_set"),
+        "DATABASE_URL_prefix": (os.getenv("DATABASE_URL", ""))[:30],
+        "db_ok": db_ok,
+        "db_error": db_error
+    }
+
+
+def _send_spa_html(path):
+        html_code = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Logistics Document Automation PoC</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    :root {
+      --bg: #E8EEF5;
+      --bg-alt: #E6EDF5;
+      --card: #0F2033;
+      --card-strong: #172B3F;
+      --table-header: #172B3F;
+      --border: #294157;
+      --text: #FFFFFF;
+      --text-soft: #C9D4DF;
+      --text-muted: #A9B9C8;
+      --primary: #0B8FD3;
+      --primary-strong: #0A7BB4;
+      --primary-soft: rgba(11, 143, 211, 0.12);
+      --success: #1FBF88;
+      --success-soft: rgba(31, 191, 136, 0.12);
+      --warning: #D9A35B;
+      --warning-soft: rgba(217, 163, 91, 0.12);
+      --danger: #EA6A6A;
+      --danger-soft: rgba(234, 106, 106, 0.12);
+      --shadow: 0 10px 24px rgba(15, 32, 51, 0.12);
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--card-strong);
+      font-family: Inter, "Segoe UI", sans-serif;
+    }
+
+    .nav-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 0.8rem;
+      padding: 0.6rem 0.9rem;
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--text-soft);
+      border: 1px solid transparent;
+      transition: all 0.2s ease;
+    }
+
+    .nav-link:hover {
+      background: var(--primary-soft);
+      border-color: rgba(11, 143, 211, 0.2);
+      color: var(--text);
+      transform: translateY(-1px);
+    }
+
+    .premium-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow);
+    }
+
+    .soft-button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s ease;
+      background: var(--primary) !important;
+      box-shadow: none;
+    }
+
+    .soft-button:hover {
+      transform: translateY(-1px);
+      background: var(--primary-strong) !important;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 9999px;
+      padding: 0.38rem 0.72rem;
+      font-size: 0.7rem;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      border: 1px solid transparent;
+    }
+
+    .status-pill.success {
+      color: #a8f0cf;
+      background: var(--success-soft);
+      border-color: rgba(32, 201, 151, 0.2);
+    }
+
+    .status-pill.warning {
+      color: #f7d6a1;
+      background: var(--warning-soft);
+      border-color: rgba(240, 178, 95, 0.2);
+    }
+
+    .status-pill.danger {
+      color: #fecaca;
+      background: var(--danger-soft);
+      border-color: rgba(248, 113, 113, 0.2);
+    }
+
+    .status-pill.neutral {
+      color: var(--text-soft);
+      background: rgba(148, 163, 184, 0.08);
+      border-color: rgba(148, 163, 184, 0.15);
+    }
+
+    .data-table th {
+      background: var(--table-header);
+      color: var(--text-soft);
+      font-size: 0.72rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-weight: 700;
+    }
+
+    .data-table td {
+      color: var(--text);
+      border-color: var(--border);
+    }
+
+    .data-table tbody tr:hover {
+      background: rgba(21, 151, 212, 0.04);
+    }
+  </style>
+</head>
+<body class="bg-[#E8EEF5] text-slate-900 min-h-screen font-sans antialiased">
+  <div id="app">
+    <header style="height:72px;background:#172B3F;border-bottom:1px solid #294157;"></header>
+    <main style="max-width:1280px;margin:0 auto;padding:40px 16px;">
+      <div style="height:28px;width:230px;border-radius:8px;background:#cbd5e1;margin-bottom:12px;opacity:.65;"></div>
+      <div style="height:16px;width:360px;border-radius:6px;background:#cbd5e1;margin-bottom:28px;opacity:.5;"></div>
+      <div style="height:280px;border-radius:20px;background:#0F2033;border:1px solid #294157;opacity:.86;"></div>
+    </main>
+  </div>
+  <script>
+    const initialPath = """ + json.dumps(path) + """;
+
+    function numVal(val, defaultVal = 0) {
+      if (val === undefined || val === null) return defaultVal;
+      const parsed = parseFloat(val);
+      return isNaN(parsed) ? defaultVal : parsed;
+    }
+
+    let customerCache = null;
+    let customerRequest = null;
+    let documentsCache = null;
+    let documentsRequest = null;
+
+    async function getCustomer() {
+      if (customerCache) return customerCache;
+      if (!customerRequest) {
+        customerRequest = fetch('/api/customer', { cache: 'force-cache' })
+          .then((response) => response.json())
+          .then((data) => data.customer || null)
+          .finally(() => { customerRequest = null; });
+      }
+      customerCache = await customerRequest;
+      return customerCache;
+    }
+
+    async function getDocuments(force = false) {
+      if (!force && documentsCache) return documentsCache;
+      if (!force && documentsRequest) return documentsRequest;
+      const url = force ? `/api/documents?refresh=${Date.now()}` : '/api/documents';
+      const request = fetch(url, { cache: 'no-store' })
+        .then((response) => response.json())
+        .then((data) => {
+          if (!data.error) documentsCache = data;
+          return data;
+        });
+      if (!force) {
+        documentsRequest = request.finally(() => { documentsRequest = null; });
+        return documentsRequest;
+      }
+      return request;
+    }
+
+    function invalidateDocuments() {
+      documentsCache = null;
+    }
+
+    function parseExtractedData(value) {
+      let parsed = value;
+      if (typeof parsed === 'string') {
+        try { parsed = JSON.parse(parsed); } catch (error) { return {}; }
+      }
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && parsed.extractedData && typeof parsed.extractedData === 'object') {
+        return parseExtractedData(parsed.extractedData);
+      }
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    }
+
+    function getSingleInvoiceExtractedData(doc) {
+      const invoice = Array.isArray(doc?.invoices) ? doc.invoices[0] : null;
+      const candidates = [
+        invoice?.extractedData,
+        invoice?.canonicalJson,
+        invoice?.finalSubmittedData,
+        doc?.extraction?.extractedData,
+        doc?.extraction?.canonicalJson,
+        doc?.extraction?.finalSubmittedData
+      ];
+      for (const candidate of candidates) {
+        const parsed = parseExtractedData(candidate);
+        if (Object.keys(parsed).length > 0) return parsed;
+      }
+      return {};
+    }
+
+    function getCurrentPath() {
+      return window.location.pathname + window.location.search;
+    }
+
+    async function loadApp() {
+      const app = document.getElementById('app');
+      const currentPath = getCurrentPath();
+      let customer = { name: 'Apex Freight Logistics', code: 'APEX', primaryColor: '#0284c7' };
+      try {
+        const d = await getCustomer();
+        if (d) customer = d;
+      } catch(e) {}
+
+      const primaryColor = customer.primaryColor || '#0284c7';
+
+      const navHtml = `
+        <header class="sticky top-0 z-50 border-b border-[#294157] bg-[#172B3F] shadow-[0_8px_24px_rgba(15,32,51,0.12)]">
+          <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex items-center justify-between h-18 py-2.5">
+              <div class="flex items-center space-x-3">
+                <div class="w-11 h-11 rounded-xl flex items-center justify-center text-white font-bold shadow-md" style="background: ${primaryColor};">🚚</div>
+                <div>
+                  <div class="flex items-center space-x-2">
+                    <span class="text-white font-semibold text-lg tracking-tight">Apex Freight Logistics</span>
+                    <span class="text-[10px] px-2 py-1 rounded-full font-bold text-white shadow-sm" style="background-color: ${primaryColor}">${customer.code} White-Label</span>
+                  </div>
+                  <p class="text-[11px] uppercase tracking-[0.18em] text-[#C9D4DF]">Document Automation Engine</p>
+                </div>
+              </div>
+              <nav class="flex items-center space-x-2 text-sm font-medium text-[#C9D4DF]">
+                <a href="/" class="nav-link">Dashboard</a>
+                <a href="/documents" class="nav-link">Documents</a>
+                <a href="/documents/upload" class="nav-link">Upload</a>
+                <a href="/review-queue" class="nav-link">Review Queue</a>
+                <a href="/invoices" class="nav-link">Invoices</a>
+              </nav>
+            </div>
+          </div>
+        </header>
+      `;
+
+      try {
+        if (currentPath === '/documents/upload') {
+          renderUploadPage(app, navHtml, primaryColor);
+        } else if (currentPath.startsWith('/documents/') && currentPath.includes('/review')) {
+          const parts = currentPath.split('/');
+          renderReviewPage(app, navHtml, primaryColor, parts[2]);
+        } else if (currentPath.startsWith('/invoices/') && currentPath.split('/').length > 2) {
+          const parts = currentPath.split('/');
+          renderInvoicePage(app, navHtml, primaryColor, parts[2]);
+        } else if (currentPath === '/invoices') {
+          renderInvoicesDashboard(app, navHtml, primaryColor);
+        } else if (currentPath === '/review-queue') {
+          renderReviewQueue(app, navHtml, primaryColor);
+        } else {
+          renderDocumentsList(app, navHtml, primaryColor);
+        }
+      } catch (err) {
+        console.error("Render Error:", err);
+        app.innerHTML = navHtml + '<div class="p-8 text-center text-rose-400">Error rendering page: ' + err.message + '</div>';
+      }
+    }
+
+    function renderUploadPage(app, navHtml, primaryColor) {
+      app.innerHTML = `
+        ${navHtml}
+        <main class="max-w-5xl mx-auto px-4 py-10">
+          <div class="premium-card rounded-2xl p-6 mb-6">
+            <div class="flex justify-between items-center gap-4 flex-wrap">
+              <div>
+                <p class="text-[11px] uppercase tracking-[0.2em] text-[#C9D4DF] mb-2">Workflow</p>
+                <h1 class="text-2xl md:text-3xl font-bold tracking-tight text-white">Document Ingestion & AI Pipeline</h1>
+                <p class="text-sm text-[#C9D4DF] mt-2">Upload PDF, DOC, DOCX, or image logistics paperwork to trigger automated extraction.</p>
+              </div>
+              <a href="/documents" class="soft-button text-xs font-semibold text-white px-4 py-2.5 rounded-xl border border-[#294157]">View All Documents</a>
+            </div>
+          </div>
+
+          <div class="premium-card rounded-2xl p-7 md:p-8">
+            <div id="dropzone" class="group border-2 border-dashed border-[#294157] bg-[#EAF2F9] hover:border-[#0B8FD3] rounded-2xl p-10 text-center cursor-pointer transition-all duration-200">
+              <input type="file" id="fileInput" class="hidden" accept=".pdf,.doc,.docx,.jpg,.jpeg,.png,.webp,.avif" multiple />
+              <div class="w-16 h-16 rounded-xl mx-auto flex items-center justify-center text-2xl shadow-md mb-4 ring-8 ring-[#EAF2F9]" style="background: ${primaryColor}; color: white;">📤</div>
+              <p class="text-xl font-semibold text-[#0F2033]">Click to upload or drag & drop document</p>
+              <p class="text-sm text-[#294157] mt-2">Supports PDF, DOC, DOCX, JPG, JPEG, PNG, WEBP, AVIF up to 25 MB</p>
+              <div id="fileSelectedInfo" class="hidden mt-5 text-sm text-[#0F2033] font-semibold bg-white border border-[#294157] rounded-full inline-flex px-3 py-1.5"></div>
+            </div>
+
+            <button id="uploadBtn" class="soft-button w-full mt-6 py-3.5 rounded-xl text-white font-bold text-sm" style="background: ${primaryColor};">
+              Start Upload & AI Processing
+            </button>
+            <div id="uploadStatus" class="hidden mt-4 text-center text-sm font-semibold text-[#0F2033] bg-white border border-[#294157] rounded-xl py-2.5"></div>
+          </div>
+        </main>
+      `;
+
+      const dropzone = document.getElementById('dropzone');
+      const fileInput = document.getElementById('fileInput');
+      const uploadBtn = document.getElementById('uploadBtn');
+      const fileSelectedInfo = document.getElementById('fileSelectedInfo');
+      const uploadStatus = document.getElementById('uploadStatus');
+
+      const updateSelectedFiles = (files) => {
+        if (!files || files.length === 0) return;
+        const dataTransfer = new DataTransfer();
+        Array.from(files).forEach((file) => dataTransfer.items.add(file));
+        fileInput.files = dataTransfer.files;
+        fileSelectedInfo.textContent = "Selected: " + fileInput.files.length + " files";
+        fileSelectedInfo.classList.remove('hidden');
+      };
+
+      dropzone.onclick = () => fileInput.click();
+      dropzone.ondragover = (e) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'copy';
+      };
+      dropzone.ondragenter = (e) => e.preventDefault();
+      dropzone.ondrop = (e) => {
+        e.preventDefault();
+        updateSelectedFiles(e.dataTransfer.files);
+      };
+      fileInput.onchange = (e) => {
+        if (e.target.files.length > 0) {
+          fileSelectedInfo.textContent = "Selected: " + e.target.files.length + " files";
+          fileSelectedInfo.classList.remove('hidden');
+        }
+      };
+
+      uploadBtn.onclick = async () => {
+        if (fileInput.files.length === 0) {
+          alert('Please select document files first.');
+          return;
+        }
+        uploadStatus.textContent = "Uploading & running AI extraction pipeline for all files...";
+        uploadStatus.classList.remove('hidden');
+
+        const formData = new FormData();
+        for (let i = 0; i < fileInput.files.length; i++) {
+            formData.append('file', fileInput.files[i]);
+        }
+
+        try {
+          const res = await fetch('/api/documents/upload', { method: 'POST', body: formData });
+          const d = await res.json();
+          if (d.success && d.documentIds && d.documentIds.length > 0) {
+            invalidateDocuments();
+            uploadStatus.textContent = "Upload successful! Redirecting to review...";
+            setTimeout(() => {
+              // Go directly to the first document's review page so polling works
+              window.location.href = `/documents/${d.documentIds[0]}/review`;
+            }, 800);
+          } else {
+            alert(d.error || "Upload failed");
+          }
+        } catch(err) {
+          alert(err.message);
+        }
+      };
+    }
+
+    async function renderDocumentsList(app, navHtml, primaryColor) {
+      const d = await getDocuments();
+      const docs = d.documents || [];
+
+      const rowsHtml = docs.map(doc => {
+        const status = doc.status || 'PENDING';
+        let statusClass = 'neutral';
+        if (status === 'EXTRACTED' || status === 'APPROVED' || status === 'INVOICE_GENERATED') statusClass = 'success';
+        else if (status === 'IN_REVIEW' || status === 'PENDING') statusClass = 'warning';
+        else if (status === 'FAILED') statusClass = 'danger';
+
+        return `
+          <tr class="border-b border-[#294157] hover:bg-[#18304A] transition">
+            <td class="px-6 py-4 font-semibold text-white">${doc.fileName}</td>
+            <td class="px-6 py-4 text-xs font-bold uppercase tracking-wide text-[#C9D4DF]">${doc.documentType}</td>
+            <td class="px-6 py-4">
+              <span class="status-pill ${statusClass}">${status}</span>
+            </td>
+            <td class="px-6 py-4 text-xs font-mono text-[#C9D4DF]">${(doc.fileSize / 1024).toFixed(1)} KB</td>
+            <td class="px-6 py-4 text-xs text-[#C9D4DF]">${new Date(doc.createdAt).toLocaleDateString()}</td>
+            <td class="px-6 py-4 text-right space-x-2">
+              <a href="/documents/${doc.id}/review" class="text-xs font-semibold text-[#0B8FD3] hover:underline">Review & Edit</a>
+              <button type="button" class="text-xs font-semibold text-red-400 hover:underline" onclick="fetch('/api/documents/${doc.id}', { method: 'DELETE' }).then(async r => { const d = await r.json(); if (!r.ok || !d.success) throw new Error(d.error || 'Delete failed'); window.location.reload(); }).catch(err => alert(err.message || 'Unable to delete document.'));">Delete</button>
+              ${doc.status === 'INVOICE_GENERATED' ? `<a href="/invoices/${doc.id}" class="text-xs font-semibold text-[#0B8FD3] hover:underline">View Invoice</a>` : ''}
+            </td>
+          </tr>
+        `;
+      }).join('');
+
+      app.innerHTML = `
+        ${navHtml}
+        <main class="max-w-7xl mx-auto px-4 py-10 space-y-6">
+          <div class="premium-card rounded-2xl p-6">
+            <div class="flex justify-between items-center gap-4 flex-wrap">
+              <div>
+                <p class="text-[11px] uppercase tracking-[0.2em] text-[#C9D4DF] mb-2">Overview</p>
+                <h1 class="text-2xl md:text-3xl font-bold tracking-tight text-white">Documents Repository</h1>
+                <p class="text-sm text-[#C9D4DF] mt-2">View and manage ingested logistics paperwork.</p>
+              </div>
+              <a href="/documents/upload" class="soft-button text-sm font-bold text-white px-5 py-3 rounded-xl" style="background: ${primaryColor};">+ Upload New Document</a>
+            </div>
+          </div>
+
+          <div class="premium-card overflow-hidden rounded-2xl">
+            <table class="data-table w-full text-left text-sm text-white">
+              <thead class="border-b border-[#294157]">
+                <tr>
+                  <th class="px-6 py-4">Filename</th>
+                  <th class="px-6 py-4">Type</th>
+                  <th class="px-6 py-4">Status</th>
+                  <th class="px-6 py-4">Size</th>
+                  <th class="px-6 py-4">Uploaded At</th>
+                  <th class="px-6 py-4 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${rowsHtml || '<tr><td colspan="6" class="p-8 text-center text-[#C9D4DF]">No documents found. Upload one to get started.</td></tr>'}
+              </tbody>
+            </table>
+          </div>
+        </main>
+      `;
+    }
+
+        async function renderBatchReviewPage(app, navHtml, primaryColor) {
+      const urlParams = new URLSearchParams(window.location.search);
+      const ids = urlParams.get('ids') ? urlParams.get('ids').split(',') : [];
+
+      const d = await getDocuments();
+      const allDocs = d.documents || [];
+
+      const docs = ids.map(id => allDocs.find(item => item.id === id)).filter(Boolean);
+
+      if (docs.length === 0) {
+        app.innerHTML = `${navHtml}<div class="p-8 text-center text-white">No documents found.</div>`;
+        return;
+      }
+
+      let formsHtml = docs.map((doc, idx) => {
+        let canonical = {
+            documentNumber: 'DHL-9982412',
+            shipmentNumber: '8492019482',
+            shipperName: 'Apex Logistics Hub',
+            consigneeName: 'Global Distribution Center',
+            carrierName: 'DHL Express Freight',
+            pickupDate: '2026-08-15',
+            deliveryDate: '2026-08-18',
+            purchaseOrderNumber: 'PO-2026-9912',
+            weightLb: 1450,
+            totalQuantity: 4,
+            subtotalCost: 1250.00,
+            freightCost: 150.00,
+            taxCost: 75.00,
+            totalAmount: 1475.00
+        };
+
+        if (doc.extraction?.finalSubmittedData) {
+            try { canonical = { ...canonical, ...JSON.parse(doc.extraction.finalSubmittedData) }; } catch(e) {}
+        } else if (doc.extraction?.canonicalJson) {
+            try { canonical = { ...canonical, ...JSON.parse(doc.extraction.canonicalJson) }; } catch(e) {}
+        }
+
+        return `
+          <div class="bg-slate-900 border border-slate-800 p-6 rounded-2xl shadow-xl mb-6 batch-form" data-docid="${doc.id}">
+            <h3 class="text-lg font-bold text-sky-400 border-b border-slate-800 pb-2 mb-4">📄 Document: ${doc.fileName}</h3>
+
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
+              <div class="col-span-2">
+                <label class="text-slate-400 block mb-1">Invoice Number</label>
+                <input type="text" data-field="documentNumber" value="${canonical.documentNumber || ''}" class="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-white" />
+              </div>
+              <div class="col-span-2">
+                <label class="text-slate-400 block mb-1">PO Number</label>
+                <input type="text" data-field="purchaseOrderNumber" value="${canonical.purchaseOrderNumber || ''}" class="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-white" />
+              </div>
+              <div class="col-span-2">
+                <label class="text-slate-400 block mb-1">Shipper</label>
+                <input type="text" data-field="shipperName" value="${canonical.shipperName || ''}" class="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-white" />
+              </div>
+              <div class="col-span-2">
+                <label class="text-slate-400 block mb-1">Consignee</label>
+                <input type="text" data-field="consigneeName" value="${canonical.consigneeName || ''}" class="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-white" />
+              </div>
+              <div>
+                <label class="text-slate-400 block mb-1">Weight</label>
+                <input type="number" data-field="weightLb" value="${canonical.weightLb || 0}" class="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-white" />
+              </div>
+              <div>
+                <label class="text-slate-400 block mb-1">Total ($)</label>
+                <input type="number" step="0.01" data-field="totalAmount" value="${canonical.totalAmount || 0}" class="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-emerald-400 font-bold" />
+              </div>
+            </div>
+          </div>
+        `;
+      }).join('');
+
+      app.innerHTML = `
+        ${navHtml}
+        <main class="max-w-5xl mx-auto px-4 py-8 space-y-6">
+          <div class="flex justify-between items-center bg-slate-900 border border-slate-800 p-6 rounded-2xl shadow-xl">
+            <div>
+              <h1 class="text-xl font-bold text-white">👁️ Batch Human-in-the-Loop Review</h1>
+              <p class="text-xs text-slate-400 mt-1">Review the extracted data for all uploaded invoices below.</p>
+            </div>
+            <button id="genBatchBtn" class="px-6 py-3 rounded-xl text-white font-bold text-sm shadow-xl" style="background-color: ${primaryColor}">
+              Generate Consolidated Invoice
+            </button>
+          </div>
+
+          <div id="batchFormsContainer">
+            ${formsHtml}
+          </div>
+        </main>
+      `;
+
+      document.getElementById('genBatchBtn').onclick = async () => {
+        const forms = document.querySelectorAll('.batch-form');
+        const invoicesData = Array.from(forms).map(form => {
+            const inputs = form.querySelectorAll('input');
+            const data = {};
+            inputs.forEach(input => {
+                const field = input.getAttribute('data-field');
+                if (input.type === 'number') {
+                    data[field] = parseFloat(input.value) || 0;
+                } else {
+                    data[field] = input.value;
+                }
+            });
+            return {
+                documentId: form.getAttribute('data-docid'),
+                data: data
+            };
+        });
+
+        const btn = document.getElementById('genBatchBtn');
+        btn.innerHTML = 'Generating... ⏳';
+        btn.disabled = true;
+
+        try {
+          const res = await fetch(`/api/batch-generate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ invoices: invoicesData })
+          });
+
+          const resData = await res.json();
+          if (resData.success) {
+            window.location.href = resData.redirectUrl;
+          } else {
+            alert(resData.error || 'Failed to generate');
+            btn.innerHTML = 'Generate Consolidated Invoice';
+            btn.disabled = false;
+          }
+        } catch(err) {
+          alert('Network error');
+          btn.innerHTML = 'Generate Consolidated Invoice';
+          btn.disabled = false;
+        }
+      };
+    }
+
+    async function renderBatchInvoicePage(app, navHtml, primaryColor) {
+      const urlParams = new URLSearchParams(window.location.search);
+      const ids = urlParams.get('ids') ? urlParams.get('ids').split(',') : [];
+
+      const d = await getDocuments();
+      const allDocs = d.documents || [];
+
+      const docs = ids.map(id => allDocs.find(item => item.id === id)).filter(Boolean);
+
+      let tableRows = '';
+      let grandTotal = 0;
+
+      docs.forEach(doc => {
+          let canonical = {};
+          try { canonical = JSON.parse(doc.extraction?.finalSubmittedData || '{}'); } catch(e) {}
+          const amt = parseFloat(canonical.totalAmount) || 0;
+          grandTotal += amt;
+          tableRows += `
+            <tr style="border-bottom: 1px solid #ddd;">
+              <td style="padding: 10px;">${canonical.documentNumber || 'N/A'}</td>
+              <td style="padding: 10px;">${canonical.purchaseOrderNumber || 'N/A'}</td>
+              <td style="padding: 10px;">${canonical.shipperName || 'N/A'}</td>
+              <td style="padding: 10px;">${canonical.consigneeName || 'N/A'}</td>
+              <td style="padding: 10px;">${canonical.weightLb || 0}</td>
+              <td style="padding: 10px; text-align: right; font-weight: bold;">$${amt.toFixed(2)}</td>
+            </tr>
+          `;
+      });
+
+      app.innerHTML = `
+        ${navHtml}
+        <style>
+          @media print {
+            body { background: white; color: black; }
+            .no-print { display: none !important; }
+            header { display: none !important; }
+          }
+        </style>
+        <main class="max-w-4xl mx-auto px-4 py-8" style="background: white; color: black; min-height: 800px; padding: 40px; font-family: Arial, sans-serif;">
+          <div class="no-print" style="margin-bottom: 20px; text-align: right;">
+            <button onclick="window.print()" style="padding: 10px 20px; background: #333; color: white; border: none; cursor: pointer;">Print / PDF</button>
+          </div>
+
+          <div style="display: flex; justify-content: space-between; border-bottom: 2px solid #000; padding-bottom: 20px; margin-bottom: 30px;">
+            <div>
+              <h1 style="margin: 0; font-size: 24px; text-transform: uppercase;">CONSOLIDATED INVOICE</h1>
+              <p style="margin: 5px 0 0 0; font-size: 14px; color: #555;">Document Batch Report</p>
+            </div>
+            <div style="text-align: right;">
+              <p style="margin: 0; font-weight: bold;">Apex Freight Logistics</p>
+              <p style="margin: 0; font-size: 12px;">100 Logistics Parkway, Suite 500<br/>Chicago, IL 60601, USA</p>
+            </div>
+          </div>
+
+          <table style="width: 100%; border-collapse: collapse; font-size: 14px; margin-bottom: 40px;">
+            <thead>
+              <tr style="background-color: #f5f5f5; border-bottom: 2px solid #333; text-align: left;">
+                <th style="padding: 10px;">Invoice #</th>
+                <th style="padding: 10px;">PO #</th>
+                <th style="padding: 10px;">Shipper</th>
+                <th style="padding: 10px;">Consignee</th>
+                <th style="padding: 10px;">Weight (Lb)</th>
+                <th style="padding: 10px; text-align: right;">Amount</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${tableRows}
+            </tbody>
+          </table>
+
+          <div style="display: flex; justify-content: flex-end;">
+            <div style="width: 300px; border-top: 2px solid #000; padding-top: 10px;">
+              <div style="display: flex; justify-content: space-between; font-weight: bold; font-size: 18px;">
+                <span>GRAND TOTAL:</span>
+                <span>$${grandTotal.toFixed(2)} USD</span>
+              </div>
+            </div>
+          </div>
+
+          <div style="margin-top: 80px; font-size: 12px; color: #666; text-align: center;">
+            <p>This is a consolidated invoice report generated from multiple uploaded documents.</p>
+          </div>
+        </main>
+      `;
+    }
+
+    async function renderReviewPage(app, navHtml, primaryColor, docId, documentOverride = null) {
+      const d = documentOverride ? null : await getDocuments(true);
+      const doc = documentOverride || (d.documents || []).find(item => item.id === docId) || {};
+
+      console.log('REVIEW API RESPONSE', { status: documentOverride ? 'cached-document' : 200, response: doc, documentId: docId });
+
+      const selectedInvoice = (Array.isArray(doc.invoices) && doc.invoices[0]) || { id: `${docId}-extracted` };
+      let canonical = getSingleInvoiceExtractedData(doc);
+      console.log('EXTRACTED DATA', canonical);
+      console.log('INVOICE HEADER', canonical?.invoiceHeader);
+
+      const extractionUnavailable = Object.keys(canonical).length === 0
+        && ['EXTRACTED', 'IN_REVIEW', 'APPROVED', 'INVOICE_GENERATED'].includes(doc.status);
+      const extractionPending = Object.keys(canonical).length === 0 && !extractionUnavailable;
+      const isPdfDocument = (doc.mimeType || '').toLowerCase().includes('pdf')
+        || (doc.fileName || '').toLowerCase().endsWith('.pdf');
+      const pollKey = `doc-status-${docId}`;
+      const previousPoll = window.__docReviewPolling?.[pollKey];
+      if (previousPoll) {
+        previousPoll.cancelled = true;
+        if (previousPoll.timeout) clearTimeout(previousPoll.timeout);
+      }
+      const pollState = { cancelled: false, timeout: null };
+      window.__docReviewPolling = window.__docReviewPolling || {};
+      window.__docReviewPolling[pollKey] = pollState;
+
+      const pollForExtractionStatus = async (attempt = 0) => {
+        if (!extractionPending || pollState.cancelled) return;
+
+        try {
+          const statusRes = await fetch(`/api/documents/${docId}/status`);
+          const statusData = await statusRes.json().catch(() => ({}));
+          if (pollState.cancelled) return;
+
+          const isExtracted = !!statusData.isExtracted || statusData.status === 'EXTRACTED';
+          if (isExtracted) {
+            const docsData = await getDocuments(true);
+            if (pollState.cancelled) return;
+            const latestDoc = (docsData.documents || []).find(item => item.id === docId) || {};
+            const latestData = parseExtractedData(statusData.extractedData);
+            if (Object.keys(latestData).length > 0) {
+              latestDoc.extraction = {
+                ...(latestDoc.extraction || {}),
+                extractedData: latestData,
+                canonicalJson: JSON.stringify(latestData)
+              };
+            }
+
+            const latestCanonical = getSingleInvoiceExtractedData(latestDoc);
+
+            if (Object.keys(latestCanonical).length > 0) {
+              pollState.cancelled = true;
+              if (window.__docReviewPolling[pollKey] === pollState) delete window.__docReviewPolling[pollKey];
+              renderReviewPage(app, navHtml, primaryColor, docId, latestDoc);
+              return;
+            }
+          }
+
+          if (!pollState.cancelled) pollState.timeout = setTimeout(() => pollForExtractionStatus(attempt + 1), 1500);
+        } catch (err) {
+          if (!pollState.cancelled) pollState.timeout = setTimeout(() => pollForExtractionStatus(attempt + 1), 1500);
+        }
+      };
+
+      let fieldsHtml = '';
+      if (extractionUnavailable) {
+        fieldsHtml = `
+          <div class="rounded-2xl border border-amber-500/25 bg-amber-500/5 p-5">
+            <p class="text-sm font-semibold text-amber-300">Extraction data unavailable</p>
+            <p class="mt-2 text-xs text-slate-400">The review API returned no extracted invoice data for this document.</p>
+          </div>
+        `;
+      } else if (extractionPending) {
+        const processingSteps = [
+          { label: 'Document Uploaded', complete: true },
+          { label: 'Extracting Information', active: true },
+          { label: 'Validating Data', complete: false },
+          { label: 'Preparing Review', complete: false }
+        ];
+
+        const stepsHtml = processingSteps.map((step, index) => {
+          const isComplete = step.complete === true;
+          const isActive = step.active === true;
+          const statusIcon = isComplete
+            ? '<span class="flex h-7 w-7 items-center justify-center rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">✓</span>'
+            : isActive
+              ? '<span class="flex h-7 w-7 items-center justify-center rounded-full bg-sky-500/20 text-sky-400 border border-sky-500/30"><span class="h-3.5 w-3.5 animate-spin rounded-full border-2 border-sky-400 border-t-transparent"></span></span>'
+              : '<span class="flex h-7 w-7 items-center justify-center rounded-full bg-slate-800 text-slate-400 border border-slate-700 text-xs font-bold">' + (index + 1) + '</span>';
+
+          return `
+            <div class="flex items-center gap-3 rounded-2xl border ${isComplete ? 'border-emerald-500/20 bg-emerald-500/5' : isActive ? 'border-sky-500/20 bg-sky-500/5' : 'border-slate-800 bg-slate-950/40'} p-3">
+              ${statusIcon}
+              <span class="text-sm font-medium ${isComplete ? 'text-emerald-300' : isActive ? 'text-sky-300' : 'text-slate-400'}">${step.label}</span>
+            </div>
+          `;
+        }).join('');
+
+        fieldsHtml = `
+          <div class="space-y-5 py-2">
+            <div class="rounded-2xl border border-slate-800 bg-slate-950/40 p-5">
+              <div class="mb-4 flex items-center justify-between">
+                <div>
+                  <p class="text-xs font-bold uppercase tracking-[0.2em] text-sky-400">Processing Status</p>
+                  <h4 class="mt-1 text-lg font-semibold text-white">Document review in progress</h4>
+                </div>
+                <span class="rounded-full border border-sky-500/25 bg-sky-500/10 px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.2em] text-sky-300">Live</span>
+              </div>
+              <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
+                ${stepsHtml}
+              </div>
+            </div>
+            <div class="rounded-2xl border border-slate-800 bg-slate-950/40 p-5 text-center">
+              <p class="text-sm text-slate-300">The n8n workflow is extracting and validating document data automatically.</p>
+              <p class="mt-2 text-xs text-slate-400">This page updates itself when processing finishes.</p>
+            </div>
+          </div>
+        `;
+        pollForExtractionStatus();
+      } else {
+        const hasKnownNested = ('invoiceHeader' in canonical) || ('shipmentDetails' in canonical) || ('shipmentDetail' in canonical) || ('chargeLineItems' in canonical);
+
+        if (hasKnownNested) {
+          // 1. invoiceHeader section
+          if (canonical.invoiceHeader && typeof canonical.invoiceHeader === 'object' && !Array.isArray(canonical.invoiceHeader)) {
+            fieldsHtml += `
+              <div class="invoice-section-panel bg-slate-900/90 p-5 rounded-2xl border border-slate-800 space-y-4 shadow-md mb-6" data-invoice-section="header">
+                <div class="flex items-center gap-2 font-bold text-sky-400 text-xs uppercase tracking-wider border-b border-slate-800 pb-3">
+                  <span class="p-1.5 bg-sky-500/10 rounded-lg text-sky-400">📄</span> Invoice Header
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            `;
+            for (const [key, value] of Object.entries(canonical.invoiceHeader)) {
+              const valStr = value === null || value === undefined ? '' : String(value);
+              fieldsHtml += `
+                <div class="space-y-1.5">
+                  <label class="text-slate-400 block font-semibold text-[11px] uppercase tracking-wider">${key}</label>
+                  <input data-section="invoiceHeader" data-key="${key.replace(/"/g, '&quot;')}" type="text" value="${valStr.replace(/"/g, '&quot;')}" class="nested-field w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3.5 py-2.5 text-white focus:border-sky-500 focus:outline-none transition-colors font-mono text-sm shadow-inner" />
+                </div>
+              `;
+            }
+            fieldsHtml += `</div></div>`;
+          }
+
+          // 2. shipmentDetails / shipmentDetail section (Array)
+          const shipmentsArr = (Array.isArray(canonical.shipmentDetails) && canonical.shipmentDetails.length > 0) ? canonical.shipmentDetails : ((Array.isArray(canonical.shipmentDetail) && canonical.shipmentDetail.length > 0) ? canonical.shipmentDetail : []);
+          const shipmentSecName = (Array.isArray(canonical.shipmentDetails) && canonical.shipmentDetails.length > 0) ? 'shipmentDetails' : 'shipmentDetail';
+          const chargeRecords = [];
+          shipmentsArr.forEach((shipment, shipmentIndex) => {
+            if (shipment && Array.isArray(shipment.chargeLineItems)) {
+              shipment.chargeLineItems.forEach((charge, chargeIndex) => chargeRecords.push({ charge, shipmentIndex, chargeIndex, label: `Shipment ${shipmentIndex + 1} Charge ${chargeIndex + 1}` }));
+            }
+          });
+          if (Array.isArray(canonical.chargeLineItems)) {
+            canonical.chargeLineItems.forEach((charge, chargeIndex) => chargeRecords.push({ charge, shipmentIndex: null, chargeIndex, label: `Charge ${chargeIndex + 1}` }));
+          }
+          
+          if (shipmentsArr.length > 0) {
+            fieldsHtml += `
+              <div class="invoice-section-panel space-y-4 mb-6" data-invoice-section="shipment">
+                <div class="flex items-center gap-2 font-bold text-sky-400 text-xs uppercase tracking-wider border-b border-slate-800 pb-2">
+                  <span class="p-1.5 bg-sky-500/10 rounded-lg text-sky-400">🚚</span> Shipment Details (${shipmentsArr.length})
+                </div>
+            `;
+            shipmentsArr.forEach((shipment, sIdx) => {
+              fieldsHtml += `
+                <div class="bg-slate-900/90 p-5 rounded-2xl border border-slate-800 space-y-4 shadow-md">
+                  <div class="text-xs font-bold text-sky-300 flex items-center justify-between border-b border-slate-800/80 pb-2.5">
+                    <span class="flex items-center gap-2">
+                      <span class="w-5 h-5 rounded-full bg-sky-500/20 text-sky-400 flex items-center justify-center text-[10px]">${sIdx + 1}</span>
+                      Shipment ${sIdx + 1}
+                    </span>
+                  </div>
+                  <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+              `;
+              if (typeof shipment === 'object' && shipment !== null) {
+                for (const [key, value] of Object.entries(shipment)) {
+                  if (key === 'chargeLineItems') continue; // Handled separately below if nested
+                  const valStr = value === null || value === undefined ? '' : String(value);
+                  fieldsHtml += `
+                    <div class="space-y-1.5">
+                      <label class="text-slate-400 block font-semibold text-[11px] uppercase tracking-wider">${key}</label>
+                      <input data-section="${shipmentSecName}" data-index="${sIdx}" data-key="${key.replace(/"/g, '&quot;')}" type="text" value="${valStr.replace(/"/g, '&quot;')}" class="nested-field w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3.5 py-2.5 text-white focus:border-sky-500 focus:outline-none transition-colors font-mono text-sm shadow-inner" />
+                    </div>
+                  `;
+                }
+              }
+              fieldsHtml += `</div>`;
+
+              fieldsHtml += `</div>`;
+            });
+            fieldsHtml += `</div>`;
+          }
+
+          // 3. All chargeLineItems, including those nested inside shipments
+          if (chargeRecords.length > 0) {
+            fieldsHtml += `
+              <div class="invoice-section-panel space-y-4 mb-6" data-invoice-section="charges">
+                <div class="flex items-center gap-2 font-bold text-sky-400 text-xs uppercase tracking-wider border-b border-slate-800 pb-2">
+                  <span class="p-1.5 bg-sky-500/10 rounded-lg text-sky-400">💳</span> Charge Line Items (${chargeRecords.length})
+                </div>
+            `;
+            chargeRecords.forEach((record, cIdx) => {
+              fieldsHtml += `
+                <div class="bg-slate-900/90 p-5 rounded-2xl border border-slate-800 space-y-4 shadow-md">
+                  <div class="text-xs font-bold text-emerald-400 flex items-center justify-between border-b border-slate-800/80 pb-2.5">
+                    <span class="flex items-center gap-2">
+                      <span class="w-5 h-5 rounded-full bg-emerald-500/20 text-emerald-400 flex items-center justify-center text-[10px]">${cIdx + 1}</span>
+                      ${record.label}
+                    </span>
+                  </div>
+                  <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+              `;
+              if (typeof record.charge === 'object' && record.charge !== null) {
+                for (const [key, value] of Object.entries(record.charge)) {
+                  const valStr = value === null || value === undefined ? '' : String(value);
+                  fieldsHtml += `
+                    <div class="space-y-1.5">
+                      <label class="text-slate-400 block font-semibold text-[11px] uppercase tracking-wider">${key}</label>
+                      <input data-section="chargeLineItems" data-index="${cIdx}" data-key="${key.replace(/"/g, '&quot;')}" type="text" value="${valStr.replace(/"/g, '&quot;')}" class="nested-field w-full bg-slate-950 border border-slate-700/80 rounded-xl px-3.5 py-2.5 text-white focus:border-sky-500 focus:outline-none transition-colors font-mono text-sm shadow-inner" />
+                    </div>
+                  `;
+                }
+              }
+              fieldsHtml += `</div></div>`;
+            });
+            fieldsHtml += `</div>`;
+          }
+
+        } else {
+          fieldsHtml = '<div class="text-sm text-slate-400">No extracted invoice sections were returned.</div>';
+        }
+      }
+
+      app.innerHTML = `
+        ${navHtml}
+        <main class="max-w-7xl mx-auto px-4 py-8 space-y-8 text-slate-100">
+          <div class="flex items-center justify-between">
+            <div>
+              <h1 class="text-3xl font-black tracking-tight text-white">Dynamic Review &amp; Edit</h1>
+              <p class="text-slate-400 mt-2">Edit the exact extracted key-value pairs before final generation.</p>
+            </div>
+            <div class="space-x-3">
+              <button id="discardReviewBtn" type="button" class="text-xs bg-slate-800 hover:bg-slate-700 text-white px-4 py-2 rounded-xl transition-colors">Discard</button>
+              ${!extractionPending ? `
+              <button id="saveReviewBtn" class="text-xs text-white px-6 py-2 rounded-xl font-bold shadow-lg hover:scale-105 transition-transform" style="background-color: ${primaryColor}">Save &amp; Approve</button>
+              <button id="genInvoiceBtn" class="text-xs bg-white text-slate-900 hover:bg-slate-200 px-6 py-2 rounded-xl font-bold transition-colors">Generate Invoice</button>` : ''}
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 xl:grid-cols-12 gap-8">
+            <div class="xl:col-span-5 bg-slate-900 border border-slate-800 p-6 rounded-2xl shadow-2xl space-y-4">
+              <h3 class="text-sm font-bold text-slate-300 border-b border-slate-800 pb-3">Original Document</h3>
+              <div class="space-y-3">
+                <div class="text-xs text-slate-400">Original uploaded document</div>
+                <div class="bg-slate-950 rounded-xl overflow-hidden border border-slate-800 h-[600px]">
+                ${isPdfDocument ? `
+                  <iframe src="/api/documents/${docId}/file#page=${selectedInvoice?.pageStart || 1}" title="Original document preview" class="w-full h-full border-0" style="background:#fff;"></iframe>
+                  <a href="/api/documents/${docId}/file#page=${selectedInvoice?.pageStart || 1}" target="_blank" rel="noopener" class="block text-center text-xs text-sky-400 mt-3 hover:underline">Open original document</a>
+                ` : `
+                  <img src="/api/documents/${docId}/file" alt="Document Preview" class="w-full h-full object-contain p-2"
+                    onerror="this.src='https://placehold.co/600x800/1e293b/475569?text=No+Preview+Available'" />
+                `}
+                </div>
+              </div>
+            </div>
+
+            <div class="xl:col-span-7 bg-slate-900 border border-slate-800 p-8 rounded-2xl shadow-2xl space-y-6">
+              <h3 class="text-base font-bold text-white border-b border-slate-800 pb-3 flex items-center gap-2">
+                <span class="text-sky-400">⚡</span> Extracted Fields
+              </h3>
+              <div id="invoiceSectionTabs" class="flex gap-2 overflow-x-auto pb-1" role="tablist" aria-label="Invoice sections">
+                <button type="button" class="invoice-section-tab px-4 py-2 rounded-xl text-xs font-bold whitespace-nowrap bg-sky-500/20 text-sky-300 border border-sky-400" data-section="header" role="tab" aria-selected="true">Invoice Header</button>
+                <button type="button" class="invoice-section-tab px-4 py-2 rounded-xl text-xs font-bold whitespace-nowrap bg-slate-950 text-slate-300 border border-slate-800" data-section="shipment" role="tab" aria-selected="false">Shipments</button>
+                <button type="button" class="invoice-section-tab px-4 py-2 rounded-xl text-xs font-bold whitespace-nowrap bg-slate-950 text-slate-300 border border-slate-800" data-section="charges" role="tab" aria-selected="false">Charge Line Items</button>
+              </div>
+              <div class="bg-slate-950/50 p-6 rounded-xl border border-slate-800/50 space-y-5 max-h-[600px] overflow-y-auto">
+                ${fieldsHtml}
+              </div>
+            </div>
+          </div>
+        </main>
+      `;
+
+      document.getElementById('discardReviewBtn').onclick = async () => {
+        const button = document.getElementById('discardReviewBtn');
+        if (!button || button.disabled) return;
+        button.disabled = true;
+        button.textContent = 'Discarding...';
+        pollState.cancelled = true;
+        if (pollState.timeout) clearTimeout(pollState.timeout);
+        if (window.__docReviewPolling[pollKey] === pollState) delete window.__docReviewPolling[pollKey];
+
+        try {
+          const response = await fetch(`/api/documents/${docId}`, { method: 'DELETE', cache: 'no-store' });
+          const result = await response.json().catch(() => ({}));
+          if (!response.ok || !result.success) throw new Error(result.error || 'Unable to discard document.');
+          invalidateDocuments();
+          history.pushState({}, '', '/documents');
+          loadApp();
+        } catch (error) {
+          button.disabled = false;
+          button.textContent = 'Discard';
+          alert(error.message || 'Unable to discard document.');
+        }
+      };
+
+      document.querySelectorAll('.invoice-section-tab').forEach((tab) => {
+        tab.onclick = () => {
+          const section = tab.dataset.section;
+          document.querySelectorAll('.invoice-section-tab').forEach((item) => {
+            const active = item === tab;
+            item.setAttribute('aria-selected', String(active));
+            item.className = `invoice-section-tab px-4 py-2 rounded-xl text-xs font-bold whitespace-nowrap ${active ? 'bg-sky-500/20 text-sky-300 border border-sky-400' : 'bg-slate-950 text-slate-300 border border-slate-800'}`;
+          });
+          document.querySelectorAll('.invoice-section-panel').forEach((panel) => {
+            panel.hidden = panel.dataset.invoiceSection !== section;
+          });
+        };
+      });
+      document.querySelectorAll('.invoice-section-panel').forEach((panel) => {
+        panel.hidden = panel.dataset.invoiceSection !== 'header';
+      });
+
+      if (!extractionPending) {
+        const collectPayload = () => {
+          const payload = {};
+          document.querySelectorAll('.nested-field').forEach(input => {
+            const section = input.getAttribute('data-section');
+            const key = input.getAttribute('data-key');
+            const indexStr = input.getAttribute('data-index');
+            let val = input.value;
+
+            if (section === 'invoiceHeader') {
+              if (!payload.invoiceHeader) payload.invoiceHeader = {};
+              payload.invoiceHeader[key] = val;
+            } else if (section === 'shipmentDetails' || section === 'shipmentDetail') {
+              const secKey = section;
+              if (!payload[secKey]) payload[secKey] = [];
+              const idx = parseInt(indexStr, 10);
+              if (!payload[secKey][idx]) payload[secKey][idx] = {};
+              payload[secKey][idx][key] = val;
+            } else if (section === 'chargeLineItems') {
+              if (!payload.chargeLineItems) payload.chargeLineItems = [];
+              const idx = parseInt(indexStr, 10);
+              if (!payload.chargeLineItems[idx]) payload.chargeLineItems[idx] = {};
+              payload.chargeLineItems[idx][key] = val;
+            } else if (section === 'root') {
+              if (val.trim().startsWith('{') || val.trim().startsWith('[')) {
+                try { val = JSON.parse(val); } catch(e) {}
+              }
+              payload[key] = val;
+            } else {
+              if (indexStr !== null && indexStr !== undefined) {
+                if (!payload[section]) payload[section] = [];
+                const idx = parseInt(indexStr, 10);
+                if (!payload[section][idx]) payload[section][idx] = {};
+                payload[section][idx][key] = val;
+              } else {
+                if (!payload[section]) payload[section] = {};
+                payload[section][key] = val;
+              }
+            }
+          });
+
+          // Collect nested charge fields inside shipments
+          document.querySelectorAll('.nested-charge-field').forEach(input => {
+            const section = input.getAttribute('data-section');
+            const sIdx = parseInt(input.getAttribute('data-ship-idx'), 10);
+            const cIdx = parseInt(input.getAttribute('data-charge-idx'), 10);
+            const cKey = input.getAttribute('data-charge-key');
+            const val = input.value;
+
+            if (!payload[section]) payload[section] = [];
+            if (!payload[section][sIdx]) payload[section][sIdx] = {};
+            if (!payload[section][sIdx].chargeLineItems) payload[section][sIdx].chargeLineItems = [];
+            if (!payload[section][sIdx].chargeLineItems[cIdx]) payload[section][sIdx].chargeLineItems[cIdx] = {};
+            payload[section][sIdx].chargeLineItems[cIdx][cKey] = val;
+          });
+
+          return payload;
+        };
+
+        document.getElementById('saveReviewBtn').onclick = async () => {
+          const payload = collectPayload();
+          const btn = document.getElementById('saveReviewBtn');
+          btn.innerHTML = 'Saving & Syncing...';
+          btn.disabled = true;
+
+          try {
+            const r = await fetch('/api/documents/' + docId + '/review', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ invoiceId: selectedInvoice?.id, editedData: payload })
+            });
+            const rd = await r.json();
+            if (rd.success) {
+              if (rd.webhookSynced) {
+                btn.innerHTML = 'Saved and synced ✓';
+              } else {
+                btn.innerHTML = 'Saved (Sync Warning ⚠️)';
+                alert('Saved to database successfully, but webhook sync failed: ' + (rd.webhookError || 'Sync warning'));
+              }
+              setTimeout(() => { btn.innerHTML = 'Save & Approve'; btn.disabled = false; }, 2500);
+            } else {
+              alert(rd.error || 'Failed to save to database');
+              btn.innerHTML = 'Save & Approve';
+              btn.disabled = false;
+            }
+          } catch(e) {
+            alert('Network error saving to database');
+            btn.innerHTML = 'Save & Approve';
+            btn.disabled = false;
+          }
+        };
+
+        document.getElementById('genInvoiceBtn').onclick = async () => {
+          const payload = collectPayload();
+          const btn = document.getElementById('genInvoiceBtn');
+          btn.innerHTML = 'Generating...'; btn.disabled = true;
+          try {
+            const r = await fetch('/api/documents/' + docId + '/generate-invoice', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ editedExtractedData: payload })
+            });
+            const rd = await r.json();
+            if (rd.success && rd.invoiceUrl) {
+              window.location.href = rd.invoiceUrl;
+            } else {
+              alert(rd.error || 'Failed to generate invoice');
+              btn.innerHTML = 'Generate Invoice'; btn.disabled = false;
+            }
+          } catch(e) { alert('Network error'); btn.innerHTML = 'Generate Invoice'; btn.disabled = false; }
+        };
+      }
+    }
+
+    async function renderInvoicePage(app, navHtml, primaryColor, docId) {
+      const d = await getDocuments();
+      const doc = (d.documents || []).find(item => item.id === docId) || {};
+
+      let canonical = {};
+      
+      // Load raw data dynamically
+      if (doc.extraction?.finalSubmittedData) {
+        try { canonical = JSON.parse(doc.extraction.finalSubmittedData); } catch(e) {}
+      } else if (doc.extraction?.canonicalJson) {
+        try { canonical = JSON.parse(doc.extraction.canonicalJson); } catch(e) {}
+      }
+
+      let gridHtml = '';
+      for (const [key, value] of Object.entries(canonical)) {
+        let displayVal = value;
+        if (typeof value === 'object') {
+           try { displayVal = JSON.stringify(value); } catch(e) { displayVal = String(value); }
+        }
+        
+        gridHtml += `
+          <div class="border-b border-slate-100 py-5 flex flex-col md:flex-row md:items-center justify-between gap-4 hover:bg-slate-50 transition-colors px-4 rounded-lg">
+             <span class="text-slate-400 font-bold uppercase tracking-widest text-xs w-full md:w-1/3 flex items-center gap-2">
+                <span class="w-1.5 h-1.5 rounded-full" style="background-color: ${primaryColor}"></span>
+                ${key}
+             </span>
+             <span class="font-black text-slate-800 text-lg w-full md:w-2/3 md:text-right font-mono" style="word-break: break-word;">
+                ${displayVal}
+             </span>
+          </div>
+        `;
+      }
+
+      app.innerHTML = `
+        ${navHtml}
+        <style>
+          @media print {
+            body { background: white; -webkit-print-color-adjust: exact; }
+            .no-print { display: none !important; }
+            header { display: none !important; }
+            main { padding: 0 !important; margin: 0 !important; max-width: 100% !important; }
+            .shadow-2xl { shadow: none !important; box-shadow: none !important; border: none !important; }
+          }
+          @keyframes slideUpFade {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+          }
+          .animate-in { animation: slideUpFade 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+        </style>
+        <main class="max-w-5xl mx-auto px-4 py-8 space-y-6 text-slate-900 animate-in">
+          <div class="flex justify-between items-center bg-slate-900 border border-slate-800 p-4 rounded-2xl shadow-lg no-print">
+            <a href="/documents/${docId}/review" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white px-4 py-2 rounded-xl transition-colors">← Back to Review</a>
+            <div class="space-x-3 flex items-center">
+              <button onclick="window.print()" class="text-xs bg-slate-800 hover:bg-slate-700 text-white px-5 py-2 rounded-xl font-bold transition-colors">🖨️ Print</button>
+              <button onclick="window.print()" class="text-xs text-white px-5 py-2 rounded-xl font-bold shadow-lg transition-transform hover:scale-105" style="background-color: ${primaryColor}">Download PDF 📥</button>
+            </div>
+          </div>
+
+          <div class="bg-white rounded-[24px] p-12 shadow-[0_20px_50px_rgba(0,0,0,0.3)] border border-slate-100 relative overflow-hidden" style="font-family: 'Inter', Arial, sans-serif;">
+            <div class="absolute top-0 left-0 w-full h-4" style="background-color: ${primaryColor}"></div>
+            <div class="absolute top-0 right-12 w-32 h-32 rounded-b-full opacity-[0.03]" style="background-color: ${primaryColor}"></div>
+
+            <div class="flex justify-between items-start border-b-2 border-slate-100 pb-12 mb-10">
+              <div>
+                <h1 class="text-4xl font-black text-slate-900 tracking-tighter mb-2 uppercase">Processed Document</h1>
+                <p class="text-sm font-bold text-slate-400 tracking-widest uppercase">System Generated Record</p>
+              </div>
+              <div class="text-right">
+                <div class="w-16 h-16 rounded-2xl flex items-center justify-center text-white font-bold shadow-lg text-2xl ml-auto mb-4" style="background-color: ${primaryColor}">📄</div>
+              </div>
+            </div>
+
+            <div class="space-y-1 mb-16">
+               ${gridHtml}
+               ${Object.keys(canonical).length === 0 ? '<div class="text-center py-20 text-slate-400 font-bold uppercase tracking-widest">No data available</div>' : ''}
+            </div>
+
+            <div class="mt-16 pt-8 border-t-2 border-slate-100 text-center text-xs text-slate-400 font-bold uppercase tracking-widest space-y-2">
+              <p>Generated by Logistics Document Automation Engine</p>
+              <p>Document ID: ${docId}</p>
+            </div>
+          </div>
+        </main>
+      `;
+    }
+
+
+    async function renderInvoicesDashboard(app, navHtml, primaryColor) {
+      const d = await getDocuments();
+      const docs = d.documents || [];
+
+      const invoices = docs.filter(doc => doc.status === 'INVOICE_GENERATED' || doc.extraction?.finalSubmittedData);
+
+      const rows = invoices.map(inv => {
+        let p = {};
+        try { p = JSON.parse(inv.extraction?.finalSubmittedData || inv.extraction?.canonicalJson || '{}'); } catch(e) {}
+        const totalVal = numVal(p.totalAmount, 1475).toFixed(2);
+        return `
+          <tr class="border-b border-slate-800/60 hover:bg-slate-800/40">
+            <td class="px-6 py-4 font-mono font-bold text-white">${p.documentNumber || 'INV-001'}</td>
+            <td class="px-6 py-4 text-xs text-slate-200">${p.shipperName || 'Apex Freight'}</td>
+            <td class="px-6 py-4 text-xs text-slate-200">${p.consigneeName || 'Global Distribution'}</td>
+            <td class="px-6 py-4 font-mono font-extrabold text-emerald-400">$${totalVal} USD</td>
+            <td class="px-6 py-4 text-xs font-bold text-emerald-400">${inv.status}</td>
+            <td class="px-6 py-4 text-right">
+              <a href="/invoices/${inv.id}" class="text-xs font-semibold text-sky-400 hover:underline">View Invoice</a>
+            </td>
+          </tr>
+        `;
+      }).join('');
+
+      app.innerHTML = `
+        ${navHtml}
+        <main class="max-w-7xl mx-auto px-4 py-8 space-y-6">
+          <div class="flex justify-between items-center">
+            <div>
+              <h1 class="text-2xl font-bold text-white">Generated Invoices Dashboard</h1>
+              <p class="text-sm text-slate-400">Browse, print, and download generated billing invoices.</p>
+            </div>
+            <a href="/documents/upload" class="px-5 py-2.5 rounded-xl text-white font-bold text-sm" style="background-color: ${primaryColor}">+ New Invoice Upload</a>
+          </div>
+
+          <div class="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-2xl">
+            <table class="w-full text-left text-sm text-slate-300">
+              <thead class="bg-slate-950 text-xs font-semibold text-slate-400 border-b border-slate-800">
+                <tr>
+                  <th class="px-6 py-4">Invoice #</th>
+                  <th class="px-6 py-4">Shipper</th>
+                  <th class="px-6 py-4">Consignee</th>
+                  <th class="px-6 py-4">Total Amount</th>
+                  <th class="px-6 py-4">Status</th>
+                  <th class="px-6 py-4 text-right">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${rows || '<tr><td colspan="6" class="p-8 text-center text-slate-400">No generated invoices found yet. Upload and generate one!</td></tr>'}
+              </tbody>
+            </table>
+          </div>
+        </main>
+      `;
+    }
+
+    async function renderReviewQueue(app, navHtml, primaryColor) {
+      const res = await fetch('/api/review-tasks');
+      const d = await res.json();
+      const tasks = d.tasks || [];
+
+      const rows = tasks.map(t => `
+        <tr class="border-b border-slate-800/60 hover:bg-slate-800/40">
+          <td class="px-6 py-4 font-semibold text-white">${t.document?.fileName || 'Document'}</td>
+          <td class="px-6 py-4 text-xs font-bold text-amber-400">NORMAL</td>
+          <td class="px-6 py-4 text-xs text-slate-300">${t.reason}</td>
+          <td class="px-6 py-4 text-xs text-slate-400">${new Date(t.createdAt).toLocaleDateString()}</td>
+          <td class="px-6 py-4 text-right">
+            <a href="/documents/${t.documentId}/review" class="text-xs font-bold text-white px-3 py-1.5 rounded-lg" style="background-color: ${primaryColor}">Open Review</a>
+          </td>
+        </tr>
+      `).join('');
+
+      app.innerHTML = `
+        ${navHtml}
+        <main class="max-w-7xl mx-auto px-4 py-8 space-y-6">
+          <div>
+            <h1 class="text-2xl font-bold text-white">Human-in-the-Loop Review Queue</h1>
+            <p class="text-sm text-slate-400">Review low-confidence extractions and authorize submission.</p>
+          </div>
+
+          <div class="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-2xl">
+            <table class="w-full text-left text-sm text-slate-300">
+              <thead class="bg-slate-950 text-xs font-semibold text-slate-400 border-b border-slate-800">
+                <tr>
+                  <th class="px-6 py-4">Document</th>
+                  <th class="px-6 py-4">Priority</th>
+                  <th class="px-6 py-4">Reason</th>
+                  <th class="px-6 py-4">Created Date</th>
+                  <th class="px-6 py-4 text-right">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${rows || '<tr><td colspan="5" class="p-8 text-center text-slate-400">All clear! No pending review tasks.</td></tr>'}
+              </tbody>
+            </table>
+          </div>
+        </main>
+      `;
+    }
+
+    document.addEventListener('click', (event) => {
+      const link = event.target.closest('a[href]');
+      if (!link || link.target || link.hasAttribute('download')) return;
+      const url = new URL(link.href, window.location.href);
+      if (url.origin !== window.location.origin || url.pathname.startsWith('/api/')) return;
+      event.preventDefault();
+      const nextPath = url.pathname + url.search;
+      if (nextPath === getCurrentPath()) return;
+      history.pushState({}, '', nextPath);
+      loadApp();
+    });
+    window.addEventListener('popstate', loadApp);
+    if (getCurrentPath() !== initialPath) history.replaceState({}, '', initialPath);
+    loadApp();
+  </script>
+</body>
+</html>"""
+        return HTMLResponse(content=html_code)
+
+def run_server():
+    with socketserver.TCPServer(("", PORT), LogisticsAutomationHandler) as httpd:
+        print(f"Logistics Document Automation PoC Web Server running at http://localhost:{PORT}")
+        httpd.serve_forever()
+
+if __name__ == "__main__":
+    run_server()
+
+@app.get("/api/customer")
+def get_customer():
+    conn = get_db()
+    cursor = execute_query(conn, "SELECT id, name, code, logoUrl, primaryColor, secondaryColor FROM Customer LIMIT 1;")
+    row = cursor.fetchone()
+    conn.close()
+    
+    customer = {
+        "id": row[0] if row else "cust-1",
+        "name": row[1] if row else "Apex Freight Logistics",
+        "code": row[2] if row else "APEX",
+        "logoUrl": row[3] if row else "/logos/apex.png",
+        "primaryColor": row[4] if row else "#0284c7",
+        "secondaryColor": row[5] if row else "#0f172a"
+    }
+    return {"success": True, "customer": customer}
+
+def _has_saved_extraction_result(data):
+    if not isinstance(data, dict):
+        return False
+    if isinstance(data.get("extractedData"), dict):
+        data = data["extractedData"]
+    return any(key in data for key in (
+        "invoiceHeader", "invoice_header", "header", "shipmentDetails",
+        "shipmentDetail", "shipment_details", "chargeLineItems",
+        "charge_line_items", "invoiceNumber", "invoice_number",
+        "invoiceNo", "invoice_no", "invoiceId", "documentNumber",
+    ))
+
+
+def _invoice_number_from_data(data):
+    extracted = _parse_invoice_json(data)
+    header = extracted.get("invoiceHeader") or extracted.get("invoice_header") or extracted.get("header") or extracted
+    if not isinstance(header, dict):
+        header = extracted
+    for key in ("invoiceNumber", "invoice_number", "invoiceNo", "invoice_no", "invoiceId", "documentNumber"):
+        value = header.get(key) or extracted.get(key)
+        if value is not None and str(value).strip():
+            return value
+    return None
+
+
+def _invoice_result_status(data, image_quality=None):
+    try:
+        has_low_visual_quality = image_quality is not None and float(image_quality) < 0.6
+    except (TypeError, ValueError):
+        has_low_visual_quality = False
+    if has_low_visual_quality:
+        return "POOR_IMAGE_QUALITY"
+    if not _has_saved_extraction_result(_parse_invoice_json(data)):
+        return "EXTRACTING"
+    return "EXTRACTED" if _invoice_number_from_data(data) else "NEEDS_REVIEW"
+
+
+@app.get("/api/documents")
+def get_documents(escalations_only: bool = False, summary: bool = False, ids: str = None):
+    try:
+        conn = get_db()
+        if escalations_only:
+            cursor = execute_query(conn, """
+                SELECT d.id, d.fileName, d.createdAt, di.id, di.invoiceIndex,
+                       di.status, di.imageQuality, di.canonicalJson, di.finalSubmittedData,
+                       COALESCE(invoice_counts.invoiceCount, 0)
+                FROM Document d
+                JOIN DocumentInvoice di ON di.documentId = d.id
+                LEFT JOIN (
+                    SELECT documentId, COUNT(*) AS invoiceCount
+                    FROM DocumentInvoice GROUP BY documentId
+                ) invoice_counts ON invoice_counts.documentId = d.id
+                WHERE di.status IN ('POOR_IMAGE_QUALITY', 'Poor Image Quality', 'NEEDS_REVIEW')
+                   OR di.imageQuality < 0.6
+                ORDER BY d.createdAt DESC, di.invoiceIndex;
+            """)
+            rows = cursor.fetchall()
+            conn.close()
+            escalation_rows = []
+            seen_invoices = set()
+            for row in rows:
+                document_id, file_name, created_at, invoice_id, invoice_index, status, image_quality, canonical_json, final_data, invoice_count = row
+                extracted = _parse_invoice_json(canonical_json or final_data)
+                if not _has_saved_extraction_result(extracted):
+                    continue
+                header = extracted.get("invoiceHeader") or extracted.get("invoice_header") or extracted.get("header") or extracted
+                if not isinstance(header, dict):
+                    header = extracted
+                invoice_number = next((
+                    header.get(key) or extracted.get(key)
+                    for key in ("invoiceNumber", "invoice_number", "invoiceNo", "invoice_no", "invoiceId", "documentNumber")
+                    if header.get(key) or extracted.get(key)
+                ), None)
+                has_invoice_number = invoice_number is not None and bool(str(invoice_number).strip())
+                has_low_visual_quality = image_quality is not None and float(image_quality) < 0.6
+                if has_invoice_number and not has_low_visual_quality:
+                    continue
+                dedupe_key = (document_id, invoice_index)
+                if dedupe_key in seen_invoices:
+                    continue
+                seen_invoices.add(dedupe_key)
+                escalation_rows.append({
+                    "id": invoice_id,
+                    "documentId": document_id,
+                    "invoiceIndex": invoice_index,
+                    "docNumber": file_name,
+                    "invoiceNumber": f"Invoice #{int(invoice_index or 0) + 1}",
+                    "reason": "Poor Image Quality" if has_low_visual_quality else "Missing Invoice Number",
+                    "date": created_at.isoformat()[:10] if hasattr(created_at, "isoformat") else str(created_at or "")[:10],
+                    "status": "Pending Review",
+                    "isMulti": invoice_count > 1,
+                    "scope": "invoice",
+                    "poorImageQuality": has_low_visual_quality,
+                    "hasInvoiceNumber": has_invoice_number,
+                    "hasExtraction": True,
+                })
+            response = JSONResponse({"success": True, "escalations": escalation_rows})
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+            return response
+
+        if summary:
+            doc_ids = [doc_id.strip() for doc_id in (ids or "").split(",") if doc_id.strip()]
+            where_clause = f"WHERE d.id IN ({','.join(['?'] * len(doc_ids))})" if doc_ids else ""
+            cursor = execute_query(conn, f"""
+                SELECT d.id, d.fileName, d.fileSize, d.mimeType, d.documentType, d.status,
+                       d.overallConfidence, d.invoiceGeneratedAt, d.createdAt,
+                       COALESCE(invoice_counts.invoiceCount, 0), d.imageQuality
+                FROM Document d
+                LEFT JOIN (
+                    SELECT documentId, COUNT(*) AS invoiceCount
+                    FROM DocumentInvoice GROUP BY documentId
+                ) invoice_counts ON invoice_counts.documentId = d.id
+                {where_clause}
+                ORDER BY d.createdAt DESC;
+            """, tuple(doc_ids))
+            docs = [{
+                "id": row[0], "fileName": row[1], "fileSize": row[2],
+                "mimeType": row[3], "documentType": row[4], "status": row[5],
+                "overallConfidence": row[6],
+                "invoiceGeneratedAt": row[7].isoformat() if hasattr(row[7], "isoformat") else row[7],
+                "createdAt": row[8].isoformat() if hasattr(row[8], "isoformat") else row[8],
+                "invoices": [], "invoiceCount": row[9], "imageQuality": row[10],
+            } for row in cursor.fetchall()]
+            poor_params = tuple(doc_ids)
+            poor_doc_filter = f" AND documentId IN ({','.join(['?'] * len(doc_ids))})" if doc_ids else ""
+            poor_cursor = execute_query(conn, f"""
+                SELECT documentId, imageQuality, canonicalJson, finalSubmittedData
+                FROM DocumentInvoice
+                WHERE (status IN ('POOR_IMAGE_QUALITY', 'Poor Image Quality', 'NEEDS_REVIEW')
+                       OR imageQuality < 0.6){poor_doc_filter};
+            """, poor_params)
+            poor_document_ids = set()
+            review_document_ids = set()
+            for document_id, image_quality, canonical_json, final_data in poor_cursor.fetchall():
+                extracted = _parse_invoice_json(canonical_json or final_data)
+                result_status = _invoice_result_status(extracted, image_quality)
+                if result_status == "POOR_IMAGE_QUALITY":
+                    poor_document_ids.add(document_id)
+                elif result_status == "NEEDS_REVIEW":
+                    review_document_ids.add(document_id)
+            for doc in docs:
+                if (doc.get("imageQuality") is not None and float(doc["imageQuality"]) < 0.6) or doc["id"] in poor_document_ids:
+                    doc["status"] = "POOR_IMAGE_QUALITY"
+                elif doc["id"] in review_document_ids:
+                    doc["status"] = "NEEDS_REVIEW"
+                elif doc["status"] in ("POOR_IMAGE_QUALITY", "Poor Image Quality"):
+                    doc["status"] = "PREPROCESSED"
+            conn.close()
+            response = JSONResponse({"success": True, "documents": docs})
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+            return response
+
+        cursor = execute_query(conn, """
+            SELECT d.id, d.fileName, d.fileSize, d.mimeType, d.storagePath, d.documentType, d.status, d.overallConfidence, d.invoiceGeneratedAt, d.createdAt, e.canonicalJson, e.confidenceScores, e.finalSubmittedData, d.imageQuality, d.errorMessage
+            FROM Document d
+            LEFT JOIN Extraction e ON d.id = e.documentId
+            ORDER BY d.createdAt DESC;
+        """)
+        rows = cursor.fetchall()
+        invoice_cursor = execute_query(conn, "SELECT id, documentId, invoiceIndex, pageStart, pageEnd, rawOcrText, canonicalJson, confidenceScores, finalSubmittedData, status, overallConfidence, imageQuality, errorMessage FROM DocumentInvoice ORDER BY documentId, invoiceIndex;")
+        invoice_rows = invoice_cursor.fetchall()
+        conn.close()
+
+        invoices_by_document = {}
+        for invoice in invoice_rows:
+          invoice_data = {}
+          try:
+            invoice_data = json.loads(invoice[6] or invoice[8] or '{}')
+          except (TypeError, json.JSONDecodeError):
+            pass
+          if isinstance(invoice_data, dict) and isinstance(invoice_data.get('extractedData'), (dict, list)):
+            invoice_data = invoice_data['extractedData']
+          invoice_header = invoice_data.get('invoiceHeader') if isinstance(invoice_data, dict) else None
+          if not isinstance(invoice_header, dict):
+            invoice_header = invoice_data if isinstance(invoice_data, dict) else {}
+          inv_status = invoice[9]
+          inv_quality = invoice[11] if len(invoice) > 11 else None
+          has_extraction = _has_saved_extraction_result(invoice_data)
+          display_status = _invoice_result_status(invoice_data, inv_quality) if has_extraction or (
+              inv_quality is not None and float(inv_quality) < 0.6
+          ) else ("PREPROCESSED" if inv_status in ("POOR_IMAGE_QUALITY", "Poor Image Quality") else (inv_status or "PENDING"))
+          is_poor = display_status == "POOR_IMAGE_QUALITY"
+
+          invoices_by_document.setdefault(invoice[1], []).append({
+            "id": invoice[0], "documentId": invoice[1], "invoiceIndex": invoice[2],
+            "pageStart": invoice[3], "pageEnd": invoice[4], "rawOcrText": invoice[5], "canonicalJson": invoice[6],
+            "confidenceScores": invoice[7], "finalSubmittedData": invoice[8],
+            "extractedData": invoice_data,
+            "status": display_status,
+            "overallConfidence": invoice[10],
+            "imageQuality": inv_quality,
+            "errorMessage": invoice[12] if len(invoice) > 12 else None,
+            "poorImageQuality": is_poor,
+            "extractionStatus": display_status,
+            "extractionComplete": has_extraction,
+            "invoiceNumber": invoice_header.get('invoiceNumber') or invoice_header.get('invoiceId') or invoice_header.get('documentNumber') or invoice_header.get('invoiceNo')
+          })
+        
+        docs = []
+        for r in rows:
+            invoice_records = invoices_by_document.get(r[0], [])
+            extraction_payload = None
+            if r[10]:
+                try:
+                    extracted_data = json.loads(r[10])
+                except (TypeError, json.JSONDecodeError):
+                    extracted_data = {}
+                if isinstance(extracted_data, dict) and isinstance(extracted_data.get('extractedData'), (dict, list)):
+                  extracted_data = extracted_data['extractedData']
+                extraction_payload = {
+                    "canonicalJson": r[10],
+                    "confidenceScores": r[11],
+                    "finalSubmittedData": r[12],
+                    "extractedData": extracted_data
+                }
+            elif invoice_records:
+                latest_invoice = invoice_records[0]
+                extraction_payload = {
+                    "canonicalJson": latest_invoice.get("canonicalJson"),
+                    "confidenceScores": latest_invoice.get("confidenceScores"),
+                    "finalSubmittedData": latest_invoice.get("finalSubmittedData"),
+                    "extractedData": latest_invoice.get("extractedData", {})
+                }
+
+            doc_status = r[6]
+            doc_quality = r[13] if len(r) > 13 else None
+            is_doc_poor = (doc_quality is not None and float(doc_quality) < 0.6) or any(
+                inv.get('poorImageQuality') for inv in invoice_records
+            )
+            has_review_needed_invoice = any(inv.get("status") == "NEEDS_REVIEW" for inv in invoice_records)
+            display_doc_status = "POOR_IMAGE_QUALITY" if is_doc_poor else (
+                "NEEDS_REVIEW" if has_review_needed_invoice else
+                ("PREPROCESSED" if doc_status in ("POOR_IMAGE_QUALITY", "Poor Image Quality")
+                else (doc_status or ("EXTRACTED" if invoice_records else "PREPROCESSED"))
+                )
+            )
+
+            doc = {
+                "id": r[0],
+                "fileName": r[1],
+                "fileSize": r[2],
+                "mimeType": r[3],
+                "storagePath": r[4],
+                "documentType": r[5],
+                "status": display_doc_status,
+                "overallConfidence": r[7],
+                "imageQuality": doc_quality if is_doc_poor else None,
+                "errorMessage": r[14] if len(r) > 14 else None,
+                "poorImageQuality": is_doc_poor,
+                "invoiceGeneratedAt": r[8].isoformat() if hasattr(r[8], "isoformat") else r[8],
+                "createdAt": r[9].isoformat() if hasattr(r[9], "isoformat") else r[9],
+                "extraction": extraction_payload
+            }
+            doc["invoices"] = invoice_records
+            doc["invoiceCount"] = len(doc["invoices"])
+            docs.append(doc)
+        payload = {"success": True, "documents": docs}
+        response = JSONResponse(payload)
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
+    except Exception as e:
+        import traceback
+        response = JSONResponse({"error": str(e), "trace": traceback.format_exc()}, status_code=500)
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return response
+
+def _parse_invoice_json(value):
+  if isinstance(value, str):
+    try:
+      value = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+      return {}
+  if isinstance(value, dict) and isinstance(value.get('extractedData'), (dict, list)):
+    value = value['extractedData']
+  return value if isinstance(value, dict) else {}
+
+
+def _serialize_invoice_row(row):
+  extracted_data = _parse_invoice_json(row[6] or row[8] or {})
+  confidence_scores = _parse_invoice_json(row[7]) if row[7] else {}
+  has_extraction = _has_saved_extraction_result(extracted_data)
+  image_quality = row[14] if len(row) > 14 else None
+  status = _invoice_result_status(extracted_data, image_quality) if has_extraction or (
+    image_quality is not None and float(image_quality) < 0.6
+  ) else (
+    "PREPROCESSED" if row[9] in ("POOR_IMAGE_QUALITY", "Poor Image Quality") else (row[9] or "PENDING")
+  )
+  # row[11] = fileName (from JOIN), row[12] = mimeType (from JOIN) — optional
+  file_name = row[11] if len(row) > 13 and row[11] else None
+  mime_type = row[12] if len(row) > 13 and row[12] else 'application/octet-stream'
+  error_message = row[13] if len(row) > 13 else row[11] if len(row) == 12 else None
+  return {
+    "id": row[0],
+    "invoiceId": row[0],
+    "documentId": row[1],
+    "invoiceIndex": row[2],
+    "pageStart": row[3],
+    "pageEnd": row[4],
+    "rawOcrText": row[5],
+    "canonicalJson": row[6],
+    "extractedData": extracted_data,
+    "confidenceScores": confidence_scores,
+    "finalSubmittedData": row[8],
+    "status": status,
+    "extractionStatus": status,
+    "errorMessage": error_message,
+    "extractionError": error_message,
+    "overallConfidence": row[10],
+    "extractionComplete": has_extraction,
+    "fileName": file_name,
+    "sourceFileName": file_name,
+    "mimeType": mime_type,
+    "imageQuality": image_quality,
+  }
+
+
+@app.get("/api/documents/{doc_id}/invoices")
+def get_document_invoices(doc_id: str, ids: str = None):
+  conn = get_db()
+  raw_ids = ids if ids else doc_id
+  doc_ids = [d.strip() for d in raw_ids.split(',') if d.strip()]
+  if not doc_ids:
+    doc_ids = [doc_id]
+
+  placeholders = ','.join(['?'] * len(doc_ids))
+  cursor = execute_query(
+    conn,
+    f"""SELECT di.id, di.documentId, di.invoiceIndex, di.pageStart, di.pageEnd,
+               di.rawOcrText, di.canonicalJson, di.confidenceScores, di.finalSubmittedData,
+               di.status, di.overallConfidence, d.fileName, d.mimeType, di.errorMessage,
+               di.imageQuality
+        FROM DocumentInvoice di
+        LEFT JOIN Document d ON di.documentId = d.id
+        WHERE di.documentId IN ({placeholders})
+        ORDER BY di.documentId ASC, di.invoiceIndex ASC""",
+    tuple(doc_ids)
+  )
+  invoices = [_serialize_invoice_row(row) for row in cursor.fetchall()]
+  conn.close()
+  return {"success": True, "documentId": doc_id, "documentIds": doc_ids, "invoiceCount": len(invoices), "invoices": invoices}
+
+
+@app.get("/api/documents/{doc_id}/invoices/{invoice_id}")
+def get_document_invoice(doc_id: str, invoice_id: str):
+  conn = get_db()
+  cursor = execute_query(conn, """
+    SELECT di.id, di.documentId, di.invoiceIndex, di.pageStart, di.pageEnd,
+           di.rawOcrText, di.canonicalJson, di.confidenceScores, di.finalSubmittedData,
+           di.status, di.overallConfidence, d.fileName, d.mimeType, di.errorMessage,
+           di.imageQuality
+    FROM DocumentInvoice di
+    LEFT JOIN Document d ON di.documentId = d.id
+    WHERE di.id = ? AND di.documentId = ?
+  """, (invoice_id, doc_id))
+  row = cursor.fetchone()
+  conn.close()
+  if not row:
+    return JSONResponse({"error": "Invoice not found for this document", "documentId": doc_id, "invoiceId": invoice_id}, status_code=404)
+  return {"success": True, "invoice": _serialize_invoice_row(row)}
+
+
+@app.delete("/api/documents/{doc_id}")
+def delete_document(doc_id: str):
+    conn = get_db()
+    try:
+        # Remove only the selected document and its related records; other documents remain untouched.
+        cursor = execute_query(conn, "SELECT storagePath, fileData FROM Document WHERE id = ?", (doc_id,))
+        row = cursor.fetchone()
+        if not row:
+            return JSONResponse({"error": "Document not found"}, status_code=404)
+
+        storage_path, file_data = row
+        if storage_path:
+            try:
+                absolute_path = os.path.normpath(os.path.join(BASE_DIR, storage_path))
+                if os.path.exists(absolute_path):
+                    os.remove(absolute_path)
+            except Exception:
+                pass
+
+        execute_query(conn, "DELETE FROM Extraction WHERE documentId = ?", (doc_id,))
+        execute_query(conn, "DELETE FROM DocumentInvoice WHERE documentId = ?", (doc_id,))
+        execute_query(conn, "DELETE FROM ReviewTask WHERE documentId = ?", (doc_id,))
+        execute_query(conn, "DELETE FROM AuditLog WHERE documentId = ?", (doc_id,))
+        execute_query(conn, "DELETE FROM Document WHERE id = ?", (doc_id,))
+        conn.commit()
+        return {"success": True, "deletedDocumentId": doc_id}
+    except Exception as e:
+        conn.rollback()
+        import traceback
+        return JSONResponse({"error": str(e), "trace": traceback.format_exc()}, status_code=500)
+    finally:
+        conn.close()
+
+@app.post("/api/documents/upload")
+async def upload_documents(request: Request):
+    try:
+        require_durable_database()
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc), "code": "DURABLE_DATABASE_REQUIRED"}, status_code=503)
+
+    return await upload_multi_document(request)
+
+@app.post("/api/documents/upload-multi")
+@app.post("/api/upload-multi-invoice")
+async def upload_multi_document(request: Request):
+    try:
+        require_durable_database()
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc), "code": "DURABLE_DATABASE_REQUIRED"}, status_code=503)
+
+    form = await request.form()
+    files = form.getlist('file')
+    if not files:
+        return JSONResponse({"error": "No files uploaded"}, status_code=400)
+
+    results = []
+    dispatches = []
+    conn = get_db()
+    try:
+        for file_item in files:
+            file_bytes = await file_item.read()
+            file_b64 = base64.b64encode(file_bytes).decode('utf-8')
+            page_count = count_pdf_pages(file_bytes) if (file_item.filename or '').lower().endswith('.pdf') else 1
+            invoice_groups = detect_invoice_groups(file_bytes, file_item.filename or '')
+            if not invoice_groups:
+                invoice_groups = [{"invoiceIndex": 0, "pageStart": 1, "pageEnd": page_count}]
+            invoice_count = len(invoice_groups)
+
+            doc_id = str(uuid.uuid4())
+            storage_path = f"api/documents/{doc_id}/file"
+            
+            initial_status = 'PREPROCESSED'
+            
+            execute_query(conn, "INSERT INTO Document (id, fileName, fileSize, mimeType, storagePath, status, pageCount, processedPages, fileData, imageQuality) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, NULL)", (doc_id, file_item.filename, len(file_bytes), file_item.content_type or 'application/octet-stream', storage_path, initial_status, page_count, file_b64))
+            
+            for idx, group in enumerate(invoice_groups):
+                inv_id = f"{doc_id}-invoice-{idx + 1}"
+                execute_query(
+                    conn,
+                    "INSERT INTO DocumentInvoice (id, documentId, invoiceIndex, pageStart, pageEnd, imageQuality, status) VALUES (?, ?, ?, ?, ?, NULL, ?)",
+                    (inv_id, doc_id, idx, group.get("pageStart", 1), group.get("pageEnd", 1), initial_status)
+                )
+            
+            if not os.getenv("VERCEL"):
+                disk_path = os.path.normpath(os.path.join(BASE_DIR, storage_path))
+                os.makedirs(os.path.dirname(disk_path), exist_ok=True)
+                with open(disk_path, 'wb') as fh:
+                    fh.write(file_bytes)
+            
+            results.append(doc_id)
+            dispatches.append({
+                "documentId": doc_id,
+                "invoiceCount": invoice_count,
+                "invoiceGroups": invoice_groups
+            })
+        conn.commit()
+        primary_doc_id = results[0] if results else None
+        return {
+            "success": True,
+            "docId": primary_doc_id,
+            "documentIds": results,
+            "dispatches": dispatches
+        }
+    except Exception as e:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+@app.get("/api/documents/{doc_id}/detect-invoices")
+def detect_invoices(doc_id: str):
+    conn = get_db()
+    cursor = execute_query(conn, "SELECT fileData, storagePath, fileName FROM Document WHERE id = ?", (doc_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return JSONResponse({"error": "Document not found"}, status_code=404)
+
+    file_data_b64, storage_path, file_name = row
+    file_bytes = None
+
+    if file_data_b64:
+        import base64
+        file_bytes = base64.b64decode(file_data_b64)
+    elif storage_path:
+        disk_path = os.path.normpath(os.path.join(BASE_DIR, storage_path))
+        if os.path.exists(disk_path):
+            with open(disk_path, "rb") as f:
+                file_bytes = f.read()
+
+    if not file_bytes:
+        return JSONResponse({"error": "File data unavailable"}, status_code=404)
+
+    try:
+        invoice_groups = detect_invoice_groups(file_bytes, file_name or "")
+        return {"success": True, "invoiceGroups": invoice_groups}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/api/config-check")
+@app.get("/api/config")
+def config_check():
+    single_webhook_url = (
+        os.getenv('SINGLE_INVOICE_N8N_WEBHOOK_URL')
+        or os.getenv('N8N_WEBHOOK_URL')
+        or SINGLE_INVOICE_WEBHOOK_URL
+    )
+    multi_webhook_url = (
+        os.getenv('MULTI_INVOICE_N8N_WEBHOOK_URL')
+        or os.getenv('N8N_WEBHOOK_URL')
+        or MULTI_INVOICE_WEBHOOK_URL
+    )
+    pypdf_ok = False
+    try:
+        from pypdf import PdfReader
+        pypdf_ok = True
+    except ImportError:
+        try:
+            from PyPDF2 import PdfReader
+            pypdf_ok = True
+        except ImportError:
+            pypdf_ok = False
+
+    return {
+        "n8nWebhookConfigured": bool(single_webhook_url and multi_webhook_url),
+        "n8nWebhookUrl": multi_webhook_url,
+        "singleInvoiceN8nWebhookUrl": single_webhook_url,
+        "multiInvoiceN8nWebhookUrl": multi_webhook_url,
+        "singleInvoiceWebhookEnvConfigured": bool(
+            os.getenv('SINGLE_INVOICE_N8N_WEBHOOK_URL') or os.getenv('N8N_WEBHOOK_URL')
+        ),
+        "multiInvoiceWebhookEnvConfigured": bool(
+            os.getenv('MULTI_INVOICE_N8N_WEBHOOK_URL') or os.getenv('N8N_WEBHOOK_URL')
+        ),
+        "pythonVersion": sys.version.split()[0],
+        "requiredLibraries": {
+            "PyPDF2": "✅" if pypdf_ok else "❌",
+            "pypdf": "✅" if pypdf_ok else "❌",
+            "requests": "✅",
+            "flask": "✅"
+        }
+    }
+
+def _looks_like_extracted_invoice(data):
+    if not isinstance(data, dict):
+        return False
+    inner = data.get("extractedData") if isinstance(data.get("extractedData"), dict) else data
+    if not isinstance(inner, dict):
+        return False
+    keys = (
+        "invoiceHeader", "header", "shipmentDetails", "chargeLineItems",
+        "invoiceNumber", "lineItems", "canonicalJson",
+    )
+    return any(inner.get(k) for k in keys)
+
+
+def _set_document_invoice_state(doc_id, invoice_id, invoice_index, page_start, page_end, status, canonical=None, error_message=None):
+    conn = None
+    try:
+        conn = get_db()
+        resolved_id = invoice_id or f"{doc_id}-invoice-{int(invoice_index) + 1}"
+        cursor = execute_query(
+            conn,
+            "SELECT id, imageQuality FROM DocumentInvoice WHERE id = ? OR (documentId = ? AND invoiceIndex = ?)",
+            (resolved_id, doc_id, invoice_index),
+        )
+        row = cursor.fetchone()
+        if status == "EXTRACTED" and canonical is not None:
+            status = _invoice_result_status(canonical, row[1] if row else None)
+        json_str = json.dumps(canonical) if canonical is not None else None
+        if row:
+            existing_id = row[0]
+            if json_str is not None:
+                execute_query(
+                    conn,
+                    "UPDATE DocumentInvoice SET status = ?, canonicalJson = ?, pageStart = COALESCE(?, pageStart), pageEnd = COALESCE(?, pageEnd), errorMessage = ?, updatedAt = CURRENT_TIMESTAMP WHERE id = ?",
+                    (status, json_str, page_start, page_end, error_message, existing_id),
+                )
+            else:
+                execute_query(
+                    conn,
+                    "UPDATE DocumentInvoice SET status = ?, pageStart = COALESCE(?, pageStart), pageEnd = COALESCE(?, pageEnd), errorMessage = ?, updatedAt = CURRENT_TIMESTAMP WHERE id = ?",
+                    (status, page_start, page_end, error_message, existing_id),
+                )
+        else:
+            execute_query(
+                conn,
+                "INSERT INTO DocumentInvoice (id, documentId, invoiceIndex, pageStart, pageEnd, canonicalJson, status, errorMessage) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (resolved_id, doc_id, invoice_index, page_start, page_end, json_str, status, error_message),
+            )
+        if status == "FAILED":
+            execute_query(
+                conn,
+                "UPDATE Document SET status = 'FAILED', errorMessage = ? WHERE id = ?",
+                (error_message, doc_id),
+            )
+        elif status in ("EXTRACTING", "EXTRACTED", "NEEDS_REVIEW", "POOR_IMAGE_QUALITY"):
+            execute_query(
+                conn,
+                "UPDATE Document SET status = ?, errorMessage = NULL WHERE id = ?",
+                (status, doc_id),
+            )
+        conn.commit()
+        return resolved_id
+    except Exception as exc:
+        print(f"[Backend] Failed updating invoice state invoiceId={invoice_id} documentId={doc_id}: {exc}")
+        raise
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+async def _internal_process_invoice(doc_id: str, invoice_index: int, page_start: int, page_end: int, invoice_id=None):
+    conn = get_db()
+    cursor = execute_query(conn, "SELECT fileData, storagePath, fileName, mimeType, fileSize FROM Document WHERE id = ?", (doc_id,))
+    row = cursor.fetchone()
+    if invoice_id:
+        invoice_cursor = execute_query(
+            conn,
+            "SELECT id, invoiceIndex, pageStart, pageEnd FROM DocumentInvoice WHERE id = ? AND documentId = ?",
+            (invoice_id, doc_id),
+        )
+    else:
+        invoice_cursor = execute_query(
+            conn,
+            "SELECT id, invoiceIndex, pageStart, pageEnd FROM DocumentInvoice WHERE documentId = ? AND invoiceIndex = ?",
+            (doc_id, invoice_index),
+        )
+    invoice_row = invoice_cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return JSONResponse({"success": False, "error": f"PDF file not found: {doc_id}"}, status_code=404)
+    if not invoice_row:
+        return JSONResponse(
+            {"success": False, "error": "Selected invoice does not belong to this document"},
+            status_code=404,
+        )
+
+    invoice_id = invoice_row[0]
+    invoice_index = invoice_row[1]
+    page_start = invoice_row[2] or 1
+    page_end = invoice_row[3] or page_start
+
+    file_data_b64, storage_path, file_name, mime_type, source_file_size = row
+    file_bytes = None
+
+    if file_data_b64:
+        file_bytes = base64.b64decode(file_data_b64)
+    elif storage_path:
+        disk_path = os.path.normpath(os.path.join(BASE_DIR, storage_path))
+        if os.path.exists(disk_path):
+            with open(disk_path, "rb") as f:
+                file_bytes = f.read()
+
+    if not file_bytes:
+        return JSONResponse({"success": False, "error": f"PDF file not found: {doc_id}"}, status_code=404)
+    if source_file_size is not None and len(file_bytes) != int(source_file_size):
+        error_message = (
+            f"Stored file size mismatch for document {doc_id}: expected {source_file_size}, "
+            f"found {len(file_bytes)} bytes"
+        )
+        _set_document_invoice_state(
+            doc_id, invoice_id, invoice_index, page_start, page_end, "FAILED",
+            error_message=error_message,
+        )
+        return JSONResponse({"success": False, "error": error_message}, status_code=500)
+
+    resolved_invoice_id = invoice_id
+    print(
+        f"[Backend] Processing isolated invoice invoiceId={resolved_invoice_id} documentId={doc_id} "
+        f"pages {page_start}-{page_end}"
+    )
+    ext = os.path.splitext(file_name or "")[1].lower()
+    if ext == ".pdf" or not ext:
+        extraction = extract_invoice_pages(file_bytes, page_start, page_end)
+        if not extraction["success"]:
+            _set_document_invoice_state(
+                doc_id, resolved_invoice_id, invoice_index, page_start, page_end, "FAILED",
+                error_message=extraction["error"],
+            )
+            return JSONResponse({"success": False, "error": extraction["error"]}, status_code=400)
+        base64_pdf = extraction["base64"]
+        print(f"[Backend] ✅ Isolated invoice PDF size: {extraction['file_size']} bytes (pages {page_start}-{page_end} only)")
+    else:
+        base64_pdf = base64.b64encode(file_bytes).decode('utf-8')
+
+    print(f"[Backend] 🔍 Analyzing image quality for invoice {resolved_invoice_id} ({file_name})...")
+    try:
+        image_quality = (
+            get_pdf_page_range_quality(file_bytes, int(page_start), int(page_end))
+            if ext == ".pdf" or not ext
+            else get_image_blur_quality(file_bytes)
+        )
+    except Exception as exc:
+        print(f"[ImageQuality] Invoice analysis failed for {resolved_invoice_id}: {exc}")
+        image_quality = None
+    quality_conn = get_db()
+    try:
+        execute_query(
+            quality_conn,
+            "UPDATE DocumentInvoice SET imageQuality = ? WHERE id = ? AND documentId = ?",
+            (image_quality, resolved_invoice_id, doc_id),
+        )
+        quality_conn.commit()
+    finally:
+        quality_conn.close()
+    print(f"[Backend] ✅ Calculated imageQuality score: {image_quality}")
+
+    webhook_result = await asyncio.to_thread(
+        send_to_n8n_webhook,
+        invoice_index, list(range(int(page_start), int(page_end) + 1)), base64_pdf,
+        doc_id=doc_id, file_bytes=file_bytes, page_start_for_ocr=page_start, page_end_for_ocr=page_end,
+        image_quality=image_quality, invoice_id=resolved_invoice_id,
+        source_file_name=file_name, source_mime_type=mime_type,
+        source_file_size=source_file_size,
+        dispatch_file_size=extraction["file_size"] if ext == ".pdf" or not ext else len(file_bytes),
+    )
+    if not webhook_result["success"]:
+        state_conn = get_db()
+        state_cursor = execute_query(
+            state_conn,
+            "SELECT status, canonicalJson FROM DocumentInvoice WHERE id = ? AND documentId = ?",
+            (resolved_invoice_id, doc_id),
+        )
+        persisted_state = state_cursor.fetchone()
+        state_conn.close()
+        persisted_data = _parse_invoice_json(persisted_state[1]) if persisted_state and persisted_state[1] else {}
+        if (
+            persisted_state
+            and persisted_state[0] in ("EXTRACTED", "APPROVED", "INVOICE_GENERATED")
+            and _looks_like_extracted_invoice(persisted_data)
+        ):
+            webhook_result = {
+                "success": True,
+                "status": webhook_result.get("status"),
+                "extractedData": persisted_data,
+            }
+        else:
+            error_message = webhook_result.get("error") or "Extraction failed"
+            _set_document_invoice_state(
+                doc_id, resolved_invoice_id, invoice_index, page_start, page_end, "FAILED",
+                error_message=error_message,
+            )
+            return JSONResponse({
+                "success": False,
+                "invoiceId": resolved_invoice_id,
+                "documentId": doc_id,
+                "pageStart": page_start,
+                "pageEnd": page_end,
+                "status": webhook_result.get("status"),
+                "error": error_message,
+            }, status_code=500)
+
+    extracted_data = webhook_result.get("extractedData")
+    if _looks_like_extracted_invoice(extracted_data):
+        to_store = extracted_data.get("extractedData") if isinstance(extracted_data, dict) and isinstance(extracted_data.get("extractedData"), dict) else extracted_data
+        _set_document_invoice_state(doc_id, resolved_invoice_id, invoice_index, page_start, page_end, "EXTRACTED", canonical=to_store)
+    else:
+        state_conn = get_db()
+        state_cursor = execute_query(
+            state_conn,
+            "SELECT status FROM DocumentInvoice WHERE id = ? AND documentId = ?",
+            (resolved_invoice_id, doc_id),
+        )
+        current_state = state_cursor.fetchone()
+        state_conn.close()
+        if not current_state or current_state[0] not in ("EXTRACTED", "APPROVED", "INVOICE_GENERATED"):
+            _set_document_invoice_state(
+                doc_id, resolved_invoice_id, invoice_index, page_start, page_end, "EXTRACTING"
+            )
+    return {
+        "success": True,
+        "invoiceId": resolved_invoice_id,
+        "invoiceIndex": invoice_index,
+        "documentId": doc_id,
+        "pageStart": page_start,
+        "pageEnd": page_end,
+        "imageQuality": image_quality,
+        "extractedData": extracted_data
+    }
+
+@app.post("/api/process-invoice")
+async def process_invoice_endpoint(request: Request):
+    try:
+        body = await request.json()
+    except Exception as e:
+        return JSONResponse({"success": False, "error": f"Invalid JSON payload: {e}"}, status_code=400)
+
+    doc_id = body.get('docId') or body.get('documentId')
+    invoice_index = body.get('invoiceIndex', 0)
+    invoice_id = body.get('invoiceId') or body.get('id')
+    pages = body.get('pages')
+    if pages and isinstance(pages, list) and len(pages) >= 1:
+        page_start = pages[0]
+        page_end = pages[-1]
+    else:
+        page_start = body.get('pageStart', 1)
+        page_end = body.get('pageEnd', 1)
+
+    if not doc_id:
+        return JSONResponse({"success": False, "error": "Missing docId parameter"}, status_code=400)
+
+    return await _internal_process_invoice(doc_id, invoice_index, page_start, page_end, invoice_id=invoice_id)
+
+@app.post("/api/documents/{doc_id}/process-single-invoice/{index_str}")
+async def process_single_invoice(doc_id: str, index_str: str, request: Request):
+    try:
+        invoice_index = int(index_str)
+    except ValueError:
+        return JSONResponse({"success": False, "error": "Invalid invoice index"}, status_code=400)
+
+    try:
+        body = await request.json()
+        invoice_id = body.get('invoiceId') or body.get('id')
+        pages = body.get('pages')
+        if pages and isinstance(pages, list) and len(pages) >= 1:
+            page_start = pages[0]
+            page_end = pages[-1]
+        else:
+            page_start = body.get('pageStart', 1)
+            page_end = body.get('pageEnd', 1)
+    except Exception:
+        page_start, page_end, invoice_id = 1, 1, None
+
+    return await _internal_process_invoice(doc_id, invoice_index, page_start, page_end, invoice_id=invoice_id)
+
+@app.get("/api/documents/{doc_id}/file")
+def get_document_file(doc_id: str):
+    import base64
+    from fastapi.responses import Response
+    conn = get_db()
+    cursor = execute_query(conn, "SELECT fileData, fileName, mimeType, storagePath FROM Document WHERE id = ?", (doc_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    file_data_b64 = row[0] if row else None
+    file_name = row[1] if row else None
+    mime_type = row[2] if row else "application/octet-stream"
+    storage_path = row[3] if row else None
+
+    if not row and not storage_path:
+        return JSONResponse({"error": "File not found"}, status_code=404)
+
+    if not file_data_b64 and storage_path:
+        disk_path = os.path.normpath(os.path.join(BASE_DIR, storage_path))
+        if os.path.exists(disk_path):
+            try:
+                with open(disk_path, 'rb') as fh:
+                    file_data_b64 = base64.b64encode(fh.read()).decode('utf-8')
+            except Exception:
+                file_data_b64 = None
+
+    if not file_data_b64:
+        return JSONResponse({"error": "File not found"}, status_code=404)
+
+    try:
+        file_bytes = base64.b64decode(file_data_b64)
+        cleaned_name = (file_name or "").lower()
+        cleaned_mime = (mime_type or "").lower()
+        is_pdf_by_signature = file_bytes.lstrip().startswith(b"%PDF")
+        is_pdf_by_name = cleaned_name.endswith(".pdf")
+        is_pdf_by_mime = "pdf" in cleaned_mime
+        is_pdf = is_pdf_by_signature or is_pdf_by_name or is_pdf_by_mime
+        if is_pdf:
+            mime_type = "application/pdf"
+        response = Response(
+            content=file_bytes,
+            media_type=mime_type,
+            headers={"Content-Disposition": f'inline; filename="{file_name or doc_id}"'}
+        )
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
+    except Exception:
+        return JSONResponse({"error": "Failed to decode file"}, status_code=500)
+
+@app.get("/api/documents/{doc_id}/page-range")
+def get_document_page_range(doc_id: str, start: int = 1, end: int = 1):
+    import io
+    from fastapi.responses import Response
+    conn = get_db()
+    cursor = execute_query(conn, "SELECT fileData, fileName, mimeType, storagePath FROM Document WHERE id = ?", (doc_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return JSONResponse({"error": "File not found"}, status_code=404)
+
+    file_data_b64, file_name, mime_type, storage_path = row
+    file_bytes = None
+    if file_data_b64:
+        try:
+            file_bytes = base64.b64decode(file_data_b64)
+        except Exception:
+            pass
+
+    if not file_bytes and storage_path:
+        disk_path = os.path.normpath(os.path.join(BASE_DIR, storage_path))
+        if os.path.exists(disk_path):
+            try:
+                with open(disk_path, 'rb') as fh:
+                    file_bytes = fh.read()
+            except Exception:
+                pass
+
+    if not file_bytes:
+        return JSONResponse({"error": "File content unavailable"}, status_code=404)
+
+    is_pdf = (file_name or "").lower().endswith(".pdf") or file_bytes.lstrip().startswith(b"%PDF")
+    content_bytes = file_bytes
+    if is_pdf:
+        try:
+            try:
+                from pypdf import PdfReader, PdfWriter
+            except ImportError:
+                from PyPDF2 import PdfReader, PdfWriter
+
+            reader = PdfReader(io.BytesIO(file_bytes))
+            total_pages = len(reader.pages)
+            if total_pages == 0 or start < 1 or end < start or end > total_pages:
+                return JSONResponse(
+                    {"error": f"Invalid PDF page range {start}-{end} for a {total_pages}-page document"},
+                    status_code=400,
+                )
+            start_idx = start - 1
+            end_idx = end - 1
+
+            writer = PdfWriter()
+            for i in range(start_idx, end_idx + 1):
+                writer.add_page(reader.pages[i])
+
+            out_stream = io.BytesIO()
+            writer.write(out_stream)
+            content_bytes = out_stream.getvalue()
+        except Exception as e:
+            print(f"[FastAPI PDF Slice Error] documentId={doc_id} pageRange={start}-{end} error={e}")
+            return JSONResponse({"error": f"Unable to isolate PDF pages {start}-{end}: {e}"}, status_code=500)
+
+    content_type = "application/pdf" if is_pdf else (mime_type or "application/octet-stream")
+    response = Response(
+        content=content_bytes,
+        media_type=content_type,
+        headers={"Content-Disposition": f'inline; filename="{file_name or doc_id}"'}
+    )
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return response
+
+@app.post("/api/documents/{doc_id}/escalate")
+async def escalate_invoice(doc_id: str, request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    invoice_id = str(body.get('invoiceId') if body.get('invoiceId') is not None else body.get('invoiceIndex', ''))
+    notes = str(body.get('notes') or body.get('reason') or '')
+
+    conn = get_db()
+    try:
+        invoice_index = int(invoice_id)
+    except ValueError:
+        invoice_index = None
+    cursor = execute_query(conn, """
+        SELECT id, canonicalJson, finalSubmittedData, imageQuality
+        FROM DocumentInvoice
+        WHERE documentId = ? AND (id = ? OR invoiceIndex = ?)
+    """, (doc_id, invoice_id, invoice_index))
+    invoice_row = cursor.fetchone()
+    if not invoice_row:
+        conn.close()
+        return JSONResponse({"error": "Invoice not found for this document"}, status_code=404)
+
+    invoice_data = _parse_invoice_json(invoice_row[1] or invoice_row[2])
+    has_low_visual_quality = invoice_row[3] is not None and float(invoice_row[3]) < 0.6
+    if not _has_saved_extraction_result(invoice_data) or (
+        _invoice_number_from_data(invoice_data) and not has_low_visual_quality
+    ):
+        conn.close()
+        return JSONResponse(
+            {"error": "Only extracted invoices flagged for visual quality or missing invoice data can be escalated"},
+            status_code=409,
+        )
+
+    invoice_id = invoice_row[0]
+    cursor = execute_query(conn, """
+        CREATE TABLE IF NOT EXISTS EscalationLog (
+            id TEXT PRIMARY KEY,
+            documentId TEXT NOT NULL,
+            invoiceId TEXT,
+            notes TEXT,
+            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    esc_id = f"esc-{uuid.uuid4().hex[:8]}"
+    execute_query(conn, "INSERT INTO EscalationLog (id, documentId, invoiceId, notes) VALUES (?, ?, ?, ?)", (esc_id, doc_id, invoice_id, notes))
+    execute_query(conn, "UPDATE DocumentInvoice SET status = 'ESCALATION_SUBMITTED' WHERE id = ? AND documentId = ?", (invoice_id, doc_id))
+    execute_query(conn, "UPDATE Document SET status = 'ESCALATION_SUBMITTED' WHERE id = ?", (doc_id,))
+    conn.commit()
+    conn.close()
+
+    return {"success": True, "escalationId": esc_id, "documentId": doc_id, "invoiceId": invoice_id}
+
+@app.post("/api/batch-generate")
+async def batch_generate(request: Request):
+    body = await request.json()
+    invoices = body.get('invoices', [])
+    now_str = datetime.utcnow().isoformat()
+    conn = get_db()
+    
+    doc_ids = []
+    for inv in invoices:
+        doc_id = inv.get('documentId')
+        json_str = json.dumps(inv.get('data'))
+        execute_query(conn, "UPDATE Extraction SET finalSubmittedData = ? WHERE documentId = ?;", (json_str, doc_id))
+        execute_query(conn, "UPDATE Document SET status = 'INVOICE_GENERATED', invoiceGeneratedAt = ? WHERE id = ?;", (now_str, doc_id))
+        doc_ids.append(doc_id)
+        
+    conn.commit()
+    conn.close()
+    return {"success": True, "redirectUrl": "/invoices/batch?ids=" + ",".join(doc_ids)}
+
+
+@app.get("/api/documents/{doc_id}/status")
+def get_document_status(doc_id: str):
+    try:
+        require_durable_database()
+        conn = get_db()
+    except RuntimeError as exc:
+        response = JSONResponse({"error": str(exc), "code": "DURABLE_DATABASE_REQUIRED"}, status_code=503)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    cursor = execute_query(conn, """
+        SELECT d.id, d.fileName, d.status, d.overallConfidence,
+               COALESCE(d.pageCount, 1), COALESCE(d.processedPages, 0),
+               e.canonicalJson, e.finalSubmittedData, d.errorMessage, d.imageQuality
+        FROM Document d
+        LEFT JOIN Extraction e ON e.documentId = d.id
+        WHERE d.id = ?;
+    """, (doc_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        response = JSONResponse({"error": "Document not found"}, status_code=404)
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return response
+
+    invoice_cursor = execute_query(conn, """
+        SELECT imageQuality, canonicalJson, finalSubmittedData
+        FROM DocumentInvoice WHERE documentId = ? ORDER BY invoiceIndex;
+    """, (doc_id,))
+    invoice_rows = invoice_cursor.fetchall() if invoice_cursor else []
+    invoice_count = len(invoice_rows)
+    conn.close()
+
+    derived_statuses = [
+        _invoice_result_status(_parse_invoice_json(canonical or final_data), quality)
+        for quality, canonical, final_data in invoice_rows
+    ]
+    has_visual_quality_failure = (
+        row[9] is not None and float(row[9]) < 0.6
+    ) or "POOR_IMAGE_QUALITY" in derived_statuses
+    status_value = "POOR_IMAGE_QUALITY" if has_visual_quality_failure else (
+        "NEEDS_REVIEW" if "NEEDS_REVIEW" in derived_statuses else
+        "PREPROCESSED" if row[2] in ("POOR_IMAGE_QUALITY", "Poor Image Quality") else row[2]
+    )
+
+    extracted_data = {}
+    for stored in (row[7], row[6]):
+        if not stored:
+            continue
+        try:
+            parsed = json.loads(stored) if isinstance(stored, str) else stored
+        except (TypeError, json.JSONDecodeError):
+            parsed = {}
+        if isinstance(parsed, dict) and parsed:
+            extracted_data = parsed
+            break
+    is_extracted = bool(extracted_data) or status_value in ["EXTRACTED", "NEEDS_REVIEW", "POOR_IMAGE_QUALITY", "IN_REVIEW", "APPROVED", "INVOICE_GENERATED"]
+    is_pdf = str(row[1] or "").lower().endswith(".pdf")
+    review_url = (
+        f"/documents/{row[0]}/multi-workspace"
+        if int(invoice_count) > 1 or is_pdf
+        else f"/documents/{row[0]}/review"
+    )
+    response = JSONResponse({
+        "success": True,
+        "documentId": row[0],
+        "fileName": row[1],
+        "status": status_value,
+        "poorImageQuality": has_visual_quality_failure,
+        "isExtracted": is_extracted,
+        "overallConfidence": row[3],
+        "pageCount": row[4],
+        "processedPages": row[5],
+        "extractedData": extracted_data,
+        "errorMessage": row[8],
+        "progress": {"current": row[5], "total": row[4]},
+        "reviewUrl": review_url
+    })
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
+@app.post("/api/documents/{doc_id}/review")
+async def save_review(doc_id: str, request: Request):
+    body = await request.json()
+    edited_data = body.get('editedData') or body.get('editedExtractedData')
+    if not edited_data:
+        return JSONResponse({"error": "Payload missing"}, status_code=400)
+
+    json_str = json.dumps(edited_data)
+    conn = get_db()
+    invoice_id = body.get('invoiceId')
+    if invoice_id:
+      cursor = execute_query(conn, "UPDATE DocumentInvoice SET finalSubmittedData = ?, status = 'APPROVED', updatedAt = CURRENT_TIMESTAMP WHERE id = ? AND documentId = ?;", (json_str, invoice_id, doc_id))
+      if cursor.rowcount == 0:
+        legacy_invoice_id = f"{doc_id}-invoice-1"
+        if invoice_id != legacy_invoice_id:
+          conn.rollback()
+          conn.close()
+          return JSONResponse({"error": "Invoice not found"}, status_code=404)
+        execute_query(conn, "UPDATE Extraction SET finalSubmittedData = ? WHERE documentId = ?;", (json_str, doc_id))
+    else:
+      execute_query(conn, "UPDATE Extraction SET finalSubmittedData = ? WHERE documentId = ?;", (json_str, doc_id))
+    execute_query(conn, "UPDATE Document SET status = 'APPROVED' WHERE id = ?;", (doc_id,))
+    conn.commit()
+    conn.close()
+
+    webhook_synced = False
+    webhook_error = None
+    try:
+        req = urllib.request.Request(
+            SAVE_APPROVED_WEBHOOK_URL,
+            data=json_str.encode('utf-8'),
+            headers={'Content-Type': 'application/json'},
+            method='POST'
+        )
+        with urllib.request.urlopen(req, timeout=10) as res:
+            if res.status in (200, 201, 204):
+                webhook_synced = True
+            else:
+                webhook_error = f"Status {res.status}"
+    except Exception as e:
+        webhook_error = str(e)
+        print(f"Server-side webhook sync warning for doc {doc_id}: {e}")
+
+    return {
+        "success": True,
+        "documentId": doc_id,
+        "webhookSynced": webhook_synced,
+        "webhookError": webhook_error
+    }
+
+@app.post("/api/documents/{doc_id}/generate-invoice")
+async def generate_invoice(doc_id: str, request: Request):
+    body = await request.json()
+    submitted = body.get('editedExtractedData') or body.get('finalData')
+
+    if not submitted:
+        return JSONResponse({"error": "Payload missing"}, status_code=400)
+
+    json_str = json.dumps(submitted)
+    now_str = datetime.utcnow().isoformat()
+
+    conn = get_db()
+    execute_query(conn, "UPDATE Extraction SET finalSubmittedData = ? WHERE documentId = ?;", (json_str, doc_id))
+    execute_query(conn, "UPDATE Document SET status = 'INVOICE_GENERATED', invoiceGeneratedAt = ? WHERE id = ?;", (now_str, doc_id))
+    execute_query(conn, "INSERT INTO AuditLog (id, documentId, action, description) VALUES (?, ?, 'INVOICE_GENERATED', 'Invoice generated');", (str(uuid.uuid4()), doc_id))
+    conn.commit()
+    conn.close()
+
+    return {
+        "success": True,
+        "documentId": doc_id,
+        "invoiceUrl": f"/invoices/{doc_id}"
+    }
+
+def _load_pdf_bytes_for_evidence(conn, doc_id):
+    cursor = execute_query(
+        conn,
+        "SELECT fileData, storagePath, fileName, mimeType FROM Document WHERE id = ?",
+        (doc_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        print(f"[Evidence] Cannot locate source document {doc_id!r}")
+        return None
+
+    file_data, storage_path, file_name, mime_type = row
+    file_bytes = None
+    if file_data:
+        if isinstance(file_data, bytes):
+            if file_data.lstrip().startswith(b"%PDF"):
+                file_bytes = file_data
+            else:
+                try:
+                    file_data = file_data.decode("utf-8")
+                except UnicodeDecodeError as error:
+                    print(f"[Evidence] Stored PDF data is invalid for {doc_id!r}: {error}")
+                    file_data = None
+        try:
+            if file_bytes is None:
+                file_bytes = base64.b64decode(file_data)
+        except (ValueError, TypeError, UnicodeDecodeError) as error:
+            print(f"[Evidence] Stored PDF data is invalid for {doc_id!r}: {error}")
+
+    if not file_bytes and storage_path:
+        disk_path = os.path.normpath(os.path.join(BASE_DIR, storage_path))
+        if os.path.isfile(disk_path):
+            try:
+                with open(disk_path, "rb") as source_file:
+                    file_bytes = source_file.read()
+            except OSError as error:
+                print(f"[Evidence] Cannot read source file for {doc_id!r}: {error}")
+
+    if not file_bytes:
+        print(f"[Evidence] Source file unavailable for {doc_id!r}")
+        return None
+    if not (file_bytes.lstrip().startswith(b"%PDF") or (mime_type or "").lower() == "application/pdf" or (file_name or "").lower().endswith(".pdf")):
+        print(f"[Evidence] Source document {doc_id!r} is not a PDF; text locations skipped")
+        return None
+    return file_bytes
+
+
+@app.post("/api/documents/{doc_id}/extraction/callback")
+async def extraction_callback(doc_id: str, request: Request):
+    try:
+        require_durable_database()
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc), "code": "DURABLE_DATABASE_REQUIRED"}, status_code=503)
+
+    try:
+        body = await request.json()
+    except Exception as e:
+        return JSONResponse({"error": f"Invalid JSON body: {e}"}, status_code=400)
+
+    invoice_payloads = body.get('invoices')
+    if not invoice_payloads and (body.get('extractedData') or body.get('canonicalJson')):
+      invoice_payloads = [{
+        "invoiceId": body.get('invoiceId'),
+        "invoiceIndex": body.get('invoiceIndex', 0),
+        "pageStart": body.get('pageStart'),
+        "pageEnd": body.get('pageEnd'),
+        "rawOcrText": body.get('rawOcrText'),
+        "canonicalJson": body.get('extractedData') or body.get('canonicalJson'),
+        "confidenceScores": body.get('confidenceScores'),
+        "overallConfidence": body.get('overallConfidence')
+      }]
+
+    if len(invoice_payloads or []) == 1:
+      wrapped = invoice_payloads[0].get('extractedData') or invoice_payloads[0].get('canonicalJson') or {}
+      if isinstance(wrapped, str):
+        try:
+          wrapped = json.loads(wrapped)
+        except json.JSONDecodeError:
+          wrapped = {}
+      if isinstance(wrapped, dict) and isinstance(wrapped.get('invoices'), list):
+        base = invoice_payloads[0]
+        invoice_payloads = [
+          {**base, **invoice, "extractedData": invoice, "invoiceIndex": invoice.get('invoiceIndex', index), "invoiceCount": len(wrapped['invoices'])}
+          for index, invoice in enumerate(wrapped['invoices'])
+        ]
+
+    if not invoice_payloads:
+        return JSONResponse({"error": "Missing extracted payload", "received_keys": list(body.keys())}, status_code=400)
+
+    conn = None
+    try:
+        conn = get_db()
+        evidence_highlights_enabled = os.getenv("VITE_ENABLE_HIGHLIGHTS", "").strip().lower() == "true"
+        pdf_bytes = _load_pdf_bytes_for_evidence(conn, doc_id) if evidence_highlights_enabled else None
+        try:
+          expected_count = int(body.get('invoiceCount') or len(invoice_payloads))
+        except (TypeError, ValueError):
+          expected_count = len(invoice_payloads)
+        for index, invoice in enumerate(invoice_payloads):
+            extracted = invoice.get('canonicalJson') or invoice.get('extractedData') or {}
+            if isinstance(extracted, str):
+                try:
+                    extracted = json.loads(extracted)
+                except json.JSONDecodeError:
+                    pass
+            if isinstance(extracted, dict) and 'extractedData' in extracted:
+              wrapped_data = extracted.get('extractedData')
+              if isinstance(wrapped_data, str):
+                try:
+                  wrapped_data = json.loads(wrapped_data)
+                except json.JSONDecodeError:
+                  wrapped_data = {}
+              if isinstance(wrapped_data, dict):
+                extracted = wrapped_data
+            if isinstance(extracted, dict) and isinstance(extracted.get('invoices'), list):
+              extracted = extracted['invoices'][0] if extracted['invoices'] else {}
+            if isinstance(extracted, dict):
+              extracted = {
+                **extracted,
+                "invoiceHeader": extracted.get('invoiceHeader') or extracted.get('invoice_header') or {},
+                "shipmentDetails": extracted.get('shipmentDetails') or extracted.get('shipment_details') or extracted.get('shipmentDetail') or [],
+                "chargeLineItems": extracted.get('chargeLineItems') or extracted.get('charge_line_items') or []
+              }
+              invoice_header = extracted['invoiceHeader']
+            invoice_index = invoice.get('invoiceIndex', index)
+            invoice_id = invoice.get('invoiceId') or f"{doc_id}-invoice-{invoice_index + 1}"
+            if isinstance(extracted, dict) and evidence_highlights_enabled and pdf_bytes:
+              page_cursor = execute_query(
+                  conn,
+                  "SELECT pageStart, pageEnd FROM DocumentInvoice WHERE id = ? OR (documentId = ? AND invoiceIndex = ?)",
+                  (invoice_id, doc_id, invoice_index),
+              )
+              saved_pages = page_cursor.fetchone()
+              page_start = invoice.get('pageStart') or (saved_pages[0] if saved_pages else None) or 1
+              page_end = invoice.get('pageEnd') or (saved_pages[1] if saved_pages else None)
+              try:
+                  extracted["locations"] = compute_pdf_locations(
+                      pdf_bytes,
+                      extracted,
+                      page_start=page_start,
+                      page_end=page_end,
+                  )
+              except Exception as error:
+                  print(f"[Evidence] Location computation failed for {invoice_id!r}: {error}")
+            json_str = json.dumps(extracted)
+            confidence_scores = invoice.get('confidenceScores')
+            if isinstance(confidence_scores, str):
+                try:
+                    confidence_scores = json.loads(confidence_scores)
+                except json.JSONDecodeError:
+                    pass
+            confidence_json = json.dumps(confidence_scores) if confidence_scores is not None else None
+
+            cursor = execute_query(
+                conn,
+                "SELECT id, imageQuality FROM DocumentInvoice WHERE id = ? OR (documentId = ? AND invoiceIndex = ?)",
+                (invoice_id, doc_id, invoice_index),
+            )
+            existing = cursor.fetchone()
+            img_quality = existing[1] if existing else None
+
+            try:
+                threshold = float(os.getenv('IMAGE_QUALITY_THRESHOLD', '0.6'))
+            except ValueError:
+                threshold = 0.6
+
+            inv_status = _invoice_result_status(extracted, img_quality)
+
+            # Upsert: first try by id, then fall back to (documentId, invoiceIndex)
+            if existing:
+                existing_id = existing[0]
+                execute_query(conn, "UPDATE DocumentInvoice SET pageStart = COALESCE(?, pageStart), pageEnd = COALESCE(?, pageEnd), rawOcrText = COALESCE(?, rawOcrText), canonicalJson = ?, confidenceScores = ?, overallConfidence = ?, imageQuality = ?, status = ?, updatedAt = CURRENT_TIMESTAMP WHERE id = ?", (invoice.get('pageStart'), invoice.get('pageEnd'), invoice.get('rawOcrText'), json_str, confidence_json, invoice.get('overallConfidence'), img_quality, inv_status, existing_id))
+            else:
+                execute_query(conn, "INSERT INTO DocumentInvoice (id, documentId, invoiceIndex, pageStart, pageEnd, rawOcrText, canonicalJson, confidenceScores, overallConfidence, imageQuality, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (invoice_id, doc_id, invoice_index, invoice.get('pageStart'), invoice.get('pageEnd'), invoice.get('rawOcrText'), json_str, confidence_json, invoice.get('overallConfidence'), img_quality, inv_status))
+
+            # Preserve the document-level record for existing consumers.
+            cursor = execute_query(conn, "SELECT 1 FROM Extraction WHERE documentId=?", (doc_id,))
+            if not cursor.fetchone():
+                execute_query(conn, "INSERT INTO Extraction (documentId, canonicalJson) VALUES (?, ?)", (doc_id, json_str))
+            elif len(invoice_payloads) == 1 and expected_count == 1:
+              # Preprocessing may have created an empty extraction row before n8n replied.
+              execute_query(conn, "UPDATE Extraction SET canonicalJson = ?, confidenceScores = ? WHERE documentId = ?", (json_str, confidence_json, doc_id))
+
+        count_cursor = execute_query(conn, "SELECT COUNT(*) FROM DocumentInvoice WHERE documentId = ?", (doc_id,))
+        received_count = count_cursor.fetchone()[0]
+        is_complete = received_count >= expected_count
+
+        cursor_poor = execute_query(conn, "SELECT COUNT(*) FROM DocumentInvoice WHERE documentId = ? AND imageQuality < 0.6", (doc_id,))
+        poor_row = cursor_poor.fetchone()
+        poor_count = poor_row[0] if poor_row else 0
+        cursor_review = execute_query(conn, "SELECT COUNT(*) FROM DocumentInvoice WHERE documentId = ? AND status = 'NEEDS_REVIEW'", (doc_id,))
+        review_row = cursor_review.fetchone()
+        review_count = review_row[0] if review_row else 0
+        cursor_doc = execute_query(conn, "SELECT status, imageQuality, fileName FROM Document WHERE id = ?", (doc_id,))
+        doc_row = cursor_doc.fetchone()
+
+        if poor_count > 0:
+            doc_status = 'POOR_IMAGE_QUALITY'
+        elif is_complete and review_count > 0:
+            doc_status = 'NEEDS_REVIEW'
+        elif is_complete:
+            doc_status = 'EXTRACTED'
+        else:
+            doc_status = 'PREPROCESSED'
+
+        execute_query(conn, "UPDATE Document SET status = ?, processedPages = CASE WHEN ? THEN COALESCE(pageCount, 1) ELSE processedPages END WHERE id = ?", (doc_status, is_complete, doc_id))
+        conn.commit()
+
+        is_pdf = doc_row and str(doc_row[2] or "").lower().endswith(".pdf")
+        review_url = (
+            f"/documents/{doc_id}/multi-workspace"
+            if is_pdf
+            else f"/documents/{doc_id}/invoices" if expected_count > 1
+            else f"/documents/{doc_id}/review"
+        )
+        return {"success": True, "invoiceCount": received_count, "expectedInvoiceCount": expected_count, "complete": is_complete, "reviewUrl": review_url}
+
+    except Exception as e:
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        import traceback
+        return JSONResponse({"error": str(e), "trace": traceback.format_exc()}, status_code=500)
+    finally:
+        if conn:
+            conn.close()
+
+@app.get("/api/review-tasks")
+def get_review_tasks():
+    conn = get_db()
+    cursor = execute_query(conn, """
+        SELECT r.id, r.documentId, r.status, r.reason, r.createdAt, d.fileName, d.documentType
+        FROM ReviewTask r
+        LEFT JOIN Document d ON r.documentId = d.id
+        ORDER BY r.createdAt DESC;
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+
+    tasks = []
+    for r in rows:
+        tasks.append({
+            "id": r[0],
+            "documentId": r[1],
+            "status": r[2],
+            "reason": r[3],
+            "createdAt": r[4],
+            "document": {"fileName": r[5], "documentType": r[6]}
+        })
+    return {"success": True, "tasks": tasks}
+
+@app.post("/api/review-tasks/{task_id}/submit-review")
+async def submit_review(task_id: str, request: Request):
+    body = await request.json()
+    corrections = body.get('corrections')
+
+    conn = get_db()
+    cursor = execute_query(conn, "SELECT documentId FROM ReviewTask WHERE id = ?;", (task_id,))
+    row = cursor.fetchone()
+
+    if row:
+        doc_id = row[0]
+        if corrections:
+            execute_query(conn, "UPDATE Extraction SET canonicalJson = ? WHERE documentId = ?;", (json.dumps(corrections), doc_id))
+        execute_query(conn, "UPDATE ReviewTask SET status = 'RESOLVED', resolvedAt = CURRENT_TIMESTAMP WHERE id = ?;", (task_id,))
+        execute_query(conn, "UPDATE Document SET status = 'APPROVED' WHERE id = ?;", (doc_id,))
+        conn.commit()
+    conn.close()
+
+    return {"success": True}
+
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+
+@app.get("/uploads/{filename}")
+def serve_upload_file(filename: str):
+    file_path = os.path.join(BASE_DIR, "uploads", filename)
+    if os.path.exists(file_path):
+        return FileResponse(file_path)
+    return JSONResponse({"error": "File not found"}, status_code=404)
+
+@app.get("/")
+def serve_spa_root():
+    return _send_spa_html("/")
+
+@app.get("/{path:path}")
+def serve_spa(path: str):
+    return _send_spa_html("/" + path)
